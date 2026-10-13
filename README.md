@@ -2,7 +2,7 @@
 
 Code-only snapshot of the refusal/disclaimer activation-steering study: Python
 scripts, source modules, and YAML configs, collected from
-`/raid/chandresh/KPdubey/refusal/` into one repo. No SLURM/shell launch
+`~/workspace/refusal/` into one repo. No SLURM/shell launch
 scripts, no logs, no data, no result files, no figures -- repo structure and
 implementation only.
 

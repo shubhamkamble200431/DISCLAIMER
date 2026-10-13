@@ -105,7 +105,7 @@ REPO_INCLUDE = [
 
 # Files lifted to the TOP of the unpacked tree, i.e. refusal/<name>, regardless of
 # where they live in the working tree. The archive is rooted at a single `refusal/`
-# segment (that is what makes it unzip cleanly inside /raid/chandresh/KPdubey/), so
+# segment (that is what makes it unzip cleanly inside ~/workspace/), so
 # "top level" means refusal/<name> -- putting a member outside refusal/ would create a
 # second top-level segment and break the unpack shape. DEPLOY_README.md is the first
 # thing a reader should see, and it also ships in its home directory via GEN_INCLUDE.
@@ -471,8 +471,8 @@ def main() -> None:
             sys.exit(1)
 
         # The unpack shape IS the deployment contract: exactly one top-level
-        # segment, so `unzip` inside /raid/chandresh/KPdubey/ lands the tree at
-        # /raid/chandresh/KPdubey/refusal/ and nothing spills beside it.
+        # segment, so `unzip` inside ~/workspace/ lands the tree at
+        # ~/workspace/refusal/ and nothing spills beside it.
         tops = sorted({n.split("/")[0] for n in names})
         if tops != [ARC_PREFIX]:
             log(f"!! top-level segments {tops}, expected ['{ARC_PREFIX}']")
@@ -545,7 +545,7 @@ def main() -> None:
             log("sha256sum the unpacked run dir on the DGX and diff against it.")
         else:
             log("C* weights are NOT in this bundle. Confirm the DGX holds")
-            log("  /raid/chandresh/KPdubey/refusal/refusal_classifier/results/runs/"
+            log("  ~/workspace/refusal/refusal_classifier/results/runs/"
                 "longformer_42_20260916-160022/")
             log("or rebuild with --with-checkpoint -- longformer_ckpt.zip at the repo")
             log("root is corrupt (no end-of-central-directory) and must not be used.")
@@ -554,10 +554,10 @@ def main() -> None:
         log("")
         log("deploy:")
         log(f"  scp {out.as_posix()} "
-            f"<user>@<dgx>:/raid/chandresh/KPdubey/")
-        log(f"  ssh <user>@<dgx> 'cd /raid/chandresh/KPdubey && "
+            f"<user>@<dgx>:~/workspace/")
+        log(f"  ssh <user>@<dgx> 'cd ~/workspace && "
             f"unzip -o {out.name}'")
-        log(f"  -> lands at /raid/chandresh/KPdubey/{ARC_PREFIX}/ "
+        log(f"  -> lands at ~/workspace/{ARC_PREFIX}/ "
             f"(read {ARC_PREFIX}/DEPLOY_README.md first)")
     finally:
         log.close()

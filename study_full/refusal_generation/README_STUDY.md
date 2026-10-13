@@ -110,7 +110,7 @@ All launchers live in `scripts/slurm/`. `study_config.sh` is **sourced, not run*
 `exec bash` wrapper that exports the right `CONDA_ENV` first.
 
 ```bash
-cd /raid/chandresh/KPdubey/refusal/refusal_generation/scripts/slurm
+cd ~/workspace/refusal/refusal_generation/scripts/slurm
 
 # ---- step 1 -------------------------------------------------------------
 # One model per submission runs them in parallel on separate GPUs:
@@ -435,5 +435,5 @@ not ship it. A valid copy of the run directory is in the working tree at
 (`best_state.pt` 567 MiB, plus `tokenizer/`, `config_snapshot.json`, `metrics.json`,
 `val_preds.npy`, `val_probs.npy`). Either re-zip that directory and `unzip -t` it before
 sending, or confirm the DGX already holds
-`/raid/chandresh/KPdubey/refusal/refusal_classifier/results/runs/longformer_42_20260916-160022/`
+`~/workspace/refusal/refusal_classifier/results/runs/longformer_42_20260916-160022/`
 — C\* must be that exact checkpoint, and a re-trained stand-in is not it.

@@ -5,10 +5,10 @@ SLURM launchers, both subprojects' code, the processed prompt tables, and the fr
 (Longformer) checkpoint. It contains **no generation-model weights** (those come from the
 DGX HF cache) and **no activations** — everything else needed to reproduce steps 1–4 is here.
 
-Every member is prefixed `refusal/`, so unpack it from `/raid/chandresh/KPdubey`:
+Every member is prefixed `refusal/`, so unpack it from `~/workspace`:
 
 ```bash
-unzip -d /raid/chandresh/KPdubey /path/to/<archive>.zip
+unzip -d ~/workspace /path/to/<archive>.zip
 ```
 
 Depth lives in `refusal/refusal_generation/README_STUDY.md` — the long operating manual.
@@ -50,7 +50,7 @@ unzip -t /path/to/<archive>.zip
 Then three checks that need **no GPU and no model download**. Run them from the generation repo:
 
 ```bash
-cd /raid/chandresh/KPdubey/refusal/refusal_generation
+cd ~/workspace/refusal/refusal_generation
 ```
 
 **(a) The steering contract self-check.** Exercises the hook, static batch membership, the
@@ -119,7 +119,7 @@ conda-activate, the banner, the torch/CUDA/transformers sanity print, and the py
 ## 4. sbatch sequence
 
 ```bash
-cd /raid/chandresh/KPdubey/refusal/refusal_generation/scripts/slurm
+cd ~/workspace/refusal/refusal_generation/scripts/slurm
 ```
 
 ### Step 1 — generate, label, split

@@ -29,7 +29,7 @@ known-good reference label, which rides along in the output as `splits=screen_<L
 ## 2. What you received
 
 Unzip **over the existing checkout** at
-`/raid/chandresh/KPdubey/refusal/refusal_generation` — this is an add-on, not a replacement.
+`~/workspace/refusal/refusal_generation` — this is an add-on, not a replacement.
 
 ```
 configs/screen.yaml                    the 15 candidate models, in the order to try them
