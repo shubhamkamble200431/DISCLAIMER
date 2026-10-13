@@ -1,0 +1,22 @@
+# base locally (8GB); swap model.name to ModernBERT-large on DGX.
+candidate: modernbert
+kind: encoder
+model:
+  name: answerdotai/ModernBERT-base
+  max_length: 1024         # only 6/3500 rows truncate here
+train:
+  truncation: head
+  class_weight: none
+  focal_gamma: 2.0
+  lr_sweep: [1.0e-5, 2.0e-5, 3.0e-5]
+  epochs: 8
+  early_stopping_patience: 2
+  batch_size: 4             # micro-batch; raise on DGX and drop grad_accum to match
+  grad_accum: 8             # effective batch = 4*8 = 32, uniform across candidates
+  eval_batch_size: 16
+  throughput_batch_size: 32
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true

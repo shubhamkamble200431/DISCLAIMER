@@ -1,0 +1,15 @@
+# Frozen e5-large-v2. The "query: " prefix is REQUIRED by E5 - omitting it
+# silently degrades the embeddings. Masked mean-pool + L2 normalise.
+candidate: frozen_embed
+kind: frozen_embed
+model:
+  name: intfloat/e5-large-v2
+  max_length: 512
+  prefix: "query: "
+  embed_batch_size: 16
+head:
+  kind: logreg
+  C: 4.0
+  max_iter: 3000
+train:
+  class_weight: none

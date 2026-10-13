@@ -1,0 +1,21 @@
+candidate: deberta_v3
+kind: encoder
+model:
+  name: microsoft/deberta-v3-base
+  max_length: 512          # 96.3% coverage; 0/1229 refusals truncate
+train:
+  truncation: head         # head_tail runs as a separate ablation config
+  class_weight: none       # default; balanced/focal are ablations only
+  focal_gamma: 2.0
+  lr_sweep: [1.0e-5, 2.0e-5, 3.0e-5]
+  epochs: 8
+  early_stopping_patience: 2   # on val DISCLAIMER F1
+  batch_size: 8             # micro-batch; raise on DGX and drop grad_accum to match
+  grad_accum: 4             # effective batch = 8*4 = 32, uniform across candidates
+  eval_batch_size: 32
+  throughput_batch_size: 32
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true   # 8GB local; harmless on DGX

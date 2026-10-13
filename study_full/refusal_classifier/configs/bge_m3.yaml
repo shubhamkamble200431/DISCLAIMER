@@ -1,0 +1,23 @@
+# Wide comparison (2026-09-17). XLM-RoBERTa-large body (568M, 8192 positions); CLS head.
+candidate: bge_m3
+kind: encoder
+model:
+  name: BAAI/bge-m3
+  revision: 5617a9f61b028005a4858fdac845db406aefb181
+  max_length: 1024
+train:
+  truncation: head
+  class_weight: none
+  focal_gamma: 2.0
+  lr_sweep: [1.0e-5, 2.0e-5, 3.0e-5]
+  epochs: 8
+  early_stopping_patience: 2
+  batch_size: 4             # micro-batch sized for a 16 GB card (5060 Ti)
+  grad_accum: 8             # effective batch = 32, uniform across candidates
+  eval_batch_size: 16
+  throughput_batch_size: 32
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true

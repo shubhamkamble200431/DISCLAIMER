@@ -1,0 +1,29 @@
+# FROZEN C*: this is the study's reference classifier, decided 2026-09-16, run dir
+# results/runs/longformer_42_20260916-160022 (see results/reports/decision_log.md).
+# Every steered answer in the direction/steering study is labelled by that exact
+# checkpoint, so nothing here may be retuned -- a change would silently redefine C*.
+# The operative settings are max_length 1024, attention_window 512, truncation head:
+# p99 is ~780 tokens, so the 4096 context is deliberately unused rather than unavailable.
+# Single LR, no sweep (pre-registered).
+candidate: longformer
+kind: encoder
+model:
+  name: allenai/longformer-base-4096
+  max_length: 1024
+  attention_window: 512
+train:
+  truncation: head
+  class_weight: none
+  focal_gamma: 2.0
+  lr_sweep: [2.0e-5]       # single LR by design
+  epochs: 8
+  early_stopping_patience: 2
+  batch_size: 2             # micro-batch; raise on DGX and drop grad_accum to match
+  grad_accum: 16            # effective batch = 2*16 = 32, uniform across candidates
+  eval_batch_size: 8
+  throughput_batch_size: 32
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true

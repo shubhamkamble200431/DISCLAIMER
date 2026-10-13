@@ -1,0 +1,117 @@
+# Generation + hidden-state capture (open-weight chat models over the dataset prompts).
+# Consumed by scripts/generate_activations.py. All paths are repo-relative.
+
+prompts:
+  splits:
+    train: data/processed/train.parquet
+    val:   data/processed/val.parquet
+    test:  data/processed/test.parquet
+  id_column: prompt_id
+  text_column: prompt
+  # the parquets hold 2 rows per prompt (side a/b); we dedupe to 1750 unique prompts
+
+output:
+  root: data/generated
+  # per_layer -> hidden/<prompt_id>/<point>_layer_<NN>.npy, one file per layer
+  # stacked   -> hidden/<prompt_id>.npz holding [n_layer_rows, hidden] per point
+  # per_layer writes ~58k files per model (33 layers x 1750 prompts); that is the
+  # requested layout, just be aware copying/rsyncing a folder of that many small
+  # files is far slower than moving the same bytes as one file per prompt.
+  hidden_layout: per_layer
+  # npz compression roughly halves size but costs ~10ms/prompt. stacked layout only.
+  compress: false
+  store_dtype: float16        # auto-promoted to float32 per-array if fp16 would overflow
+
+capture:
+  # residual stream row l=0 is the embedding output, l=n_blocks the final hidden state
+  layers: all                 # 'all' | 'every:4' | [0, 8, 16, 24, -1]
+  points:
+    # THE capture point: the last token of the fully chat-formatted prompt, taken from
+    # the prefill pass immediately before the model emits its first response token.
+    # For a Qwen chat template that is the final token of "<|im_start|>assistant\n".
+    # Every record stores `rendered_prompt`, so the exact string is auditable per prompt.
+    - prompt_last
+  # Other points the runner supports, if you ever want them back (each costs one more
+  # [n_layer_rows, H] array per prompt, ~0.2 MB):
+  #   prompt_mean   mean over all prompt positions
+  #   gen_first     state at the first generated token
+  #   gen_mean      mean over every generated token position
+  #   gen_last      state at the final generated token (normally EOS)
+  #
+  # Note prompt_last is independent of everything that happens during generation: it is
+  # unaffected by max_new_tokens, by whether the answer was truncated, and by the EOS
+  # position. Generation still runs because the answers themselves are a deliverable --
+  # if they ever stop being needed, max_new_tokens could drop to 1 and the run would
+  # take minutes instead of hours.
+
+  # >0 also stores [n_layer_rows, k, H] for the final k prompt tokens. Costs k x more disk.
+  last_k_prompt_tokens: 0
+
+generation:
+  max_new_tokens: 512
+  do_sample: false            # greedy: reruns are reproducible and activations comparable
+  seed: 42                    # only meaningful when do_sample is true
+
+# -----------------------------------------------------------------------------
+# Model roster. hidden/layers verified against each repo's config.json.
+#
+#   Qwen/Qwen3.5-4B          hidden 2560  32 blocks (33 rows)  Qwen3_5ForConditionalGeneration
+#   google/gemma-4-E2B-it    hidden 1536  35 blocks (36 rows)  Gemma4ForConditionalGeneration
+#   Qwen/Qwen3.5-9B          hidden 4096  32 blocks (33 rows)  Qwen3_5ForConditionalGeneration
+#
+# gemma-4-E2B-it declares transformers 5.5.0.dev0 -- 'model_type gemma4' is NOT in
+# transformers 5.2.0. Upgrade transformers on the server; --preflight reports this
+# before any weights are downloaded.
+#
+# Third slot: there is no Qwen3.5-7B. The dense Qwen3.5 line is 0.8B / 2B / 4B / 9B /
+# 27B, so 9B is the nearest to 7B (9.7B params, ungated). Note slots 1 and 3 are now
+# the same family and generation, which makes this a SCALE comparison (4B vs 9B) with
+# Gemma-4-E2B as the only cross-family contrast. If you want a third family back:
+#   ibm-granite/granite-4.2-8b              4096  40 blocks   (IBM, Aug 2026, dense 8.8B)
+#   utter-project/EuroLLM-9B-Instruct-2512  4096  42 blocks   (llama arch, Jan 2026)
+#   mistralai/Mistral-7B-Instruct-v0.3      4096  32 blocks   (2024, dated)
+#   meta-llama/Llama-3.1-8B-Instruct        4096  32 blocks   (2024, gated)
+# Avoid ornith-ai/Ornith-1.5-9B: it reports model_type qwen3_5, i.e. a Qwen derivative.
+# -----------------------------------------------------------------------------
+models:
+  - name: qwen3.5-4b
+    # https://huggingface.co/Qwen/Qwen3.5-4B   (ungated, 4.7B params on disk)
+    hf_id: Qwen/Qwen3.5-4B
+    dtype: bfloat16
+    device_map: auto
+    attn_implementation: sdpa
+    system_prompt: null       # no system prompt: measure the model's own refusal behaviour
+    chat_template_kwargs:
+      enable_thinking: false  # hybrid-reasoning template; keep answers free of think traces
+
+  - name: gemma-4-e2b
+    # https://huggingface.co/google/gemma-4-E2B-it   (ungated, 5.1B params on disk --
+    # "E2B" is the effective/active size, the checkpoint itself is larger)
+    hf_id: google/gemma-4-E2B-it
+    dtype: bfloat16
+    device_map: auto
+    attn_implementation: eager   # Gemma attention softcapping is exact only under eager
+    system_prompt: null
+
+  - name: qwen3.5-9b
+    # https://huggingface.co/Qwen/Qwen3.5-9B   (ungated, 9.7B params on disk)
+    hf_id: Qwen/Qwen3.5-9B
+    dtype: bfloat16
+    device_map: auto
+    attn_implementation: sdpa
+    system_prompt: null
+    chat_template_kwargs:
+      enable_thinking: false  # same hybrid-reasoning template as the 4B
+
+# --smoke swaps in this roster (tiny, ungated) and caps the prompt count.
+smoke:
+  n_prompts: 3
+  generation:
+    max_new_tokens: 24
+  models:
+    - name: smoke-qwen2.5-1.5b
+      # https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct   (ungated, 1.5B)
+      hf_id: Qwen/Qwen2.5-Coder-1.5B-Instruct
+      dtype: bfloat16
+      device_map: auto
+      attn_implementation: sdpa
