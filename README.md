@@ -7,38 +7,40 @@
 DISCLAIMER/
 ├── README.md
 ├── requirements.txt
-├── generation/                       
+|── classifier/                       
 │   ├── configs/
-│   │   ├── study.yaml                
-│   │   └── generate.yaml             
-│   ├── scripts/
-│   │   ├── generate_label_split.py   
-│   │   ├── layer_probe.py            
-│   │   ├── directions_steering.py    
-│   │   ├── splithalf_geometry_cross.py  
-│   │   ├── token_overlap.py           
-│   │   ├── random_control.py        
-│   │   ├── generate_activations.py   
-│   │   └── parity_batched_capture.py 
-│   └── src/
-│       ├── generate.py               
-│       ├── batched_capture.py       
-│       └── steer.py                 
-└── classifier/                       
+|   │   └── longformer.yaml           
+|   ├── data/
+|   │   └── processed/
+|   │       ├── train.parquet         
+|   │       ├── val.parquet           
+|   │       └── test.parquet          
+|   ├── scripts/
+|   │   ├── train_transformer.py      
+|   │   └── predict.py                
+|   └── src/
+|        ├── data.py                   
+|        ├── train.py                  
+|        └── metrics.py  
+|
+└── generation/                       
     ├── configs/
-    │   └── longformer.yaml           
-    ├── data/
-    │   └── processed/
-    │       ├── train.parquet         
-    │       ├── val.parquet           
-    │       └── test.parquet          
+    │   ├── study.yaml                
+    │   └── generate.yaml             
     ├── scripts/
-    │   ├── train_transformer.py      
-    │   └── predict.py                
+    │   ├── generate_label_split.py   
+    │   ├── layer_probe.py            
+    │   ├── directions_steering.py    
+    │   ├── splithalf_geometry_cross.py  
+    │   ├── token_overlap.py           
+    │   ├── random_control.py        
+    │   ├── generate_activations.py   
+    │   └── parity_batched_capture.py 
     └── src/
-        ├── data.py                   
-        ├── train.py                  
-        └── metrics.py               
+        ├── generate.py               
+        ├── batched_capture.py       
+        └── steer.py                 
+             
 ```
 
 ## Setup
@@ -53,6 +55,28 @@ pip install -r requirements.txt
 
 
 ## CLI commands
+All commands run from inside `classifier/`.
+
+```bash
+
+python scripts/train_transformer.py --config configs/longformer.yaml --smoke
+
+python scripts/train_transformer.py --config configs/longformer.yaml --seed 42
+
+python scripts/predict.py --generated ../generation/data/generated
+```
+
+`classifier/src/data.py`, `train.py`, and `metrics.py` are library
+modules only (data loading/label collapse, the training harness, and
+shared metrics), imported by the two scripts above and with no CLI of
+their own.
+
+Training writes the checkpoint to
+`classifier/results/runs/longformer_<seed>_<timestamp>/`. Point
+`study.classifier_run_dir` in `generation/configs/study.yaml` at that
+directory, and pass it to `predict.py` with `--run`.
+
+
 
 All commands run from inside `generation/`.
 
@@ -102,24 +126,5 @@ python scripts/directions_steering.py --config configs/study.yaml --stage steer 
 
 
 
-All commands run from inside `classifier/`.
 
-```bash
-
-python scripts/train_transformer.py --config configs/longformer.yaml --smoke
-
-python scripts/train_transformer.py --config configs/longformer.yaml --seed 42
-
-python scripts/predict.py --generated ../generation/data/generated
-```
-
-`classifier/src/data.py`, `train.py`, and `metrics.py` are library
-modules only (data loading/label collapse, the training harness, and
-shared metrics), imported by the two scripts above and with no CLI of
-their own.
-
-Training writes the checkpoint to
-`classifier/results/runs/longformer_<seed>_<timestamp>/`. Point
-`study.classifier_run_dir` in `generation/configs/study.yaml` at that
-directory, and pass it to `predict.py` with `--run`.
 
