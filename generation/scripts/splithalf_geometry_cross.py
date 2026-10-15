@@ -1,43 +1,3 @@
-"""Step 7 -- split-half geometry: median cross cos(d_D, d_R) with a 95% split-half interval.
-
-Step 3's single full-split S = cos(d_D, d_R) is inflated by the mu_N that d_D and d_R
-share. This step replaces it with the split-half CROSS estimate, which removes that:
-
-  1. per model, per layer in the union of the top-10 layers by AUROC(REFUSAL vs rest)
-     and the top-10 by AUROC(DISCLAIMER vs rest), both read from step 2's probe table
-     (selected_layers.json -> per_layer_table; same tie-break as step 2: higher AUROC
-     first, then the shallower row)
-  2. the 40% Direction split is cut 50/50 into halves A and B, stratified by the model's
-     own C* label so each half holds half the REFUSAL and half the DISCLAIMER prompts
-  3. in each half: d_D(A), d_R(A), d_D(B), d_R(B) with step 2's balanced
-     difference-of-means (NORMAL subsampled to min(n_R, n_D) of that half, K draws,
-     mean of unit vectors, renormalised) -- the function is imported from step 2
-  4.   cross = 1/2 [cos(d_D(A), d_R(B)) + cos(d_R(A), d_D(B))]
-     cross pairs a direction from A with one from B, so the two never share a mu_N
-     estimate; that removes step 3's shared-mu_N inflation. No reliability correction.
-  5. repeated over --n-splits (200) seeds
-  6. per layer: median(cross) = the dot, 2.5th / 97.5th percentiles = the 95% interval.
-
---layer-set selected keeps the old behaviour (step 2's top-10 by mean AUROC); --layer-set
-all runs every steerable row; --layers overrides all of them.
-
-CPU only. Reads the `prompt_last` activations step 1 wrote and step 2's
-selected_layers.json; writes nothing outside results/reports/step7_cross[_smoke]/.
-
-OUTPUTS (results/reports/step7_cross/<slug>/)
-  splits.parquet    one row per (seed, layer): cross + half sizes
-  summary.csv/.parquet  one row per layer: median_cross, p2_5, p97_5
-  step7_<slug>.png/.pdf   dot-whisker plot
-  step7.json        provenance: split sha, label counts, layers (and which top-10 list
-                    each came from), K, n_splits, seed
-and step7_combined.png/.pdf over every model with a summary (--stage plot).
-
-Usage:
-  python -X utf8 scripts/step7_splithalf_geometry.py                    # all models
-  python -X utf8 scripts/step7_splithalf_geometry.py --models olmo3-7b
-  python -X utf8 scripts/step7_splithalf_geometry.py --stage plot
-  python -X utf8 scripts/step7_splithalf_geometry.py --smoke --models smoke-olmo2-1b
-"""
 from __future__ import annotations
 
 import argparse
@@ -53,24 +13,22 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src import generate as G  # noqa: E402
+from src import generate as G
 
 DEFAULT_CONFIG = "configs/study.yaml"
 LABELS3 = ("NORMAL", "DISCLAIMER", "REFUSAL")
 
 
-def import_step2():
-    """Step 2's loaders and estimator, imported rather than copied, so the halves use
-    exactly the direction estimator that produced the steering vectors."""
-    path = ROOT / "scripts" / "step2_directions_steering.py"
-    spec = importlib.util.spec_from_file_location("step2_directions_steering", path)
+def import_directions_steering():
+    path = ROOT / "scripts" / "directions_steering.py"
+    spec = importlib.util.spec_from_file_location("directions_steering", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-S2 = import_step2()
+DS = import_directions_steering()
 
 
 def sub_seed(*parts: int) -> int:
@@ -78,8 +36,6 @@ def sub_seed(*parts: int) -> int:
 
 
 def stratified_halves(lab: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Boolean mask, True = half A. Each class is permuted and cut in two; an odd class
-    gives its extra prompt to A or B at random so neither half is systematically larger."""
     in_a = np.zeros(len(lab), dtype=bool)
     for c in LABELS3:
         idx = np.flatnonzero(lab == c)
@@ -92,38 +48,35 @@ def stratified_halves(lab: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
 
 def half_directions(Xl: np.ndarray, lab: np.ndarray, draws: int, seed: int):
-    """(d_D, d_R) on one half, step 2's estimator, NORMAL balanced to min(n_R, n_D)."""
     XN, XD, XR = Xl[lab == "NORMAL"], Xl[lab == "DISCLAIMER"], Xl[lab == "REFUSAL"]
     target_n = min(len(XR), len(XD))
-    dD = S2.balanced_dim(XD, XN, target_n, draws, seed)
-    dR = S2.balanced_dim(XR, XN, target_n, draws, seed + 1)
+    dD = DS.balanced_dim(XD, XN, target_n, draws, seed)
+    dR = DS.balanced_dim(XR, XN, target_n, draws, seed + 1)
     return dD, dR
 
 
 def top_by(table: list[dict], key: str, k: int) -> list[int]:
-    """Top-k steerable rows by one AUROC column, step 2's tie-break (shallower wins)."""
     cand = [r for r in table if r["steerable"] and r.get(key) is not None]
     if len(cand) < k:
-        S2.fail(f"only {len(cand)} steerable rows with {key}, need {k}")
+        DS.fail(f"only {len(cand)} steerable rows with {key}, need {k}")
     cand.sort(key=lambda r: (-r[key], r["layer_row"]))
     return sorted(int(r["layer_row"]) for r in cand[:k])
 
 
 def resolve_layers(cfg, ctx, args, splits) -> tuple[list[int], dict]:
-    """(layers, provenance). The staleness guard on selected_layers.json runs first in
-    every mode, so a retired probe table can never feed the union."""
-    selected = S2.load_selected_layers(cfg, ctx.slug, study_sha=splits.get("sha256"))
+    selected = DS.load_selected_layers(cfg, ctx.slug, study_sha=splits.get("sha256"))
     if args.layers:
         layers = sorted(int(x) for x in args.layers.split(","))
         return layers, {"layer_set": "manual"}
     if args.layer_set == "selected":
-        return selected, {"layer_set": "selected (step 2 top-k by mean AUROC)"}
+        return selected, {"layer_set": "selected (directions_steering's own union of top-k "
+                                       "AUROC(R)/top-k AUROC(D))"}
     if args.layer_set == "all":
         return list(range(1, ctx.n_blocks)), {"layer_set": "all steerable rows"}
-    doc = json.loads((S2.study_dir(cfg) / "selected_layers.json").read_text(encoding="utf-8"))
+    doc = json.loads((DS.study_dir(cfg) / "selected_layers.json").read_text(encoding="utf-8"))
     table = (doc.get("per_layer_table") or {}).get(ctx.slug)
     if not table:
-        S2.fail(f"{ctx.slug}: selected_layers.json has no per_layer_table entry")
+        DS.fail(f"{ctx.slug}: selected_layers.json has no per_layer_table entry")
     k = int(args.top_k or (cfg.get("probe") or {}).get("top_k", 10))
     top_R = top_by(table, "auroc_R_vs_rest", k)
     top_D = top_by(table, "auroc_D_vs_rest", k)
@@ -152,7 +105,7 @@ def compute_model(cfg, ctx, args, splits, labels, out_root: Path, log) -> None:
     layers, layer_prov = resolve_layers(cfg, ctx, args, splits)
     for l in layers:
         if not 1 <= l <= ctx.n_blocks - 1:
-            S2.fail(f"{ctx.slug}: layer row {l} is outside the steerable 1..{ctx.n_blocks - 1}")
+            DS.fail(f"{ctx.slug}: layer row {l} is outside the steerable 1..{ctx.n_blocks - 1}")
 
     dir_ids = splits["splits"]["direction"]
     log(f"\n=== {ctx.slug}: split-half cross, {len(dir_ids)} Direction-split prompts, "
@@ -160,19 +113,19 @@ def compute_model(cfg, ctx, args, splits, labels, out_root: Path, log) -> None:
     if "top_R" in layer_prov:
         log(f"  top-{layer_prov['top_k']} AUROC R: {layer_prov['top_R']}")
         log(f"  top-{layer_prov['top_k']} AUROC D: {layer_prov['top_D']}")
-    X, kept = S2.load_stack(ctx, dir_ids, "prompt_last", log)
-    X = X[:, layers, :]                                     # [n, len(layers), H]
+    X, kept = DS.load_stack(ctx, dir_ids, "prompt_last", log)
+    X = X[:, layers, :]
     lab = (labels[labels.gen_model == ctx.slug].set_index("prompt_id")["label"]
            .reindex(kept))
     if lab.isna().any():
-        S2.fail(f"{ctx.slug}: {int(lab.isna().sum())} Direction-split prompts have no C* label")
+        DS.fail(f"{ctx.slug}: {int(lab.isna().sum())} Direction-split prompts have no C* label")
     lab = lab.to_numpy().astype(str)
     counts = {c: int((lab == c).sum()) for c in LABELS3}
     log(f"  labels (own C*): {counts}  -> ~{counts['REFUSAL'] // 2} R / "
         f"{counts['DISCLAIMER'] // 2} D per half")
     for c, n in counts.items():
         if n < 4:
-            S2.fail(f"{ctx.slug}: {c} has n={n}; each half needs >= 2 rows per class")
+            DS.fail(f"{ctx.slug}: {c} has n={n}; each half needs >= 2 rows per class")
 
     model_seed = sub_seed(seed, int(G.sha1(ctx.slug)[:8], 16))
     Xd = [X[:, j, :].astype(np.float64) for j in range(len(layers))]
@@ -203,22 +156,22 @@ def compute_model(cfg, ctx, args, splits, labels, out_root: Path, log) -> None:
     df.to_parquet(out / "splits.parquet", index=False)
     summ.to_parquet(out / "summary.parquet", index=False)
     summ.to_csv(out / "summary.csv", index=False)
-    S2.write_json(out / "step7.json", {
-        "slug": ctx.slug, "hf_id": ctx.spec.hf_id, "written_utc": S2.utcnow(),
+    DS.write_json(out / "splithalf_geometry_cross.json", {
+        "slug": ctx.slug, "hf_id": ctx.spec.hf_id, "written_utc": DS.utcnow(),
         "seed": seed, "n_splits": int(args.n_splits), "balance_draws": draws,
         "layers": layers, **layer_prov,
         "n_prompts": len(kept), "label_counts": counts,
         "study_split_sha256": splits.get("sha256"),
         "method": {
             "halves": "50/50 of the Direction split, stratified by own C* label",
-            "estimator": "step 2 balanced difference-of-means, per half",
+            "estimator": "directions_steering balanced difference-of-means, per half",
             "cross": "0.5*[cos(d_D(A), d_R(B)) + cos(d_R(A), d_D(B))]",
             "interval": "2.5th / 97.5th percentile of cross over splits",
         },
         "summary": summ.to_dict(orient="records"),
     })
     log(f"  {len(df)} (split, layer) rows in {time.perf_counter() - t0:.0f}s -> "
-        f"{S2.rel_to_root(out)}")
+        f"{DS.rel_to_root(out)}")
     log(f"\n  {'layer':>5} {'median':>8} {'p2.5':>8} {'p97.5':>8}")
     for r in summ.itertuples():
         log(f"  {r.layer:>5} {r.median_cross:>8.3f} {r.p2_5:>8.3f} {r.p97_5:>8.3f}")
@@ -255,16 +208,15 @@ def plot_model(slug: str, summ: pd.DataFrame, df: pd.DataFrame, out: Path, log) 
     ax.legend(fontsize=8, loc="lower right")
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        fig.savefig(out / f"step7_{slug}.{ext}", dpi=200)
+        fig.savefig(out / f"splithalf_geometry_cross_{slug}.{ext}", dpi=200)
     plt.close(fig)
-    log(f"  plot -> {S2.rel_to_root(out / f'step7_{slug}.png')}")
+    log(f"  plot -> {DS.rel_to_root(out / f'splithalf_geometry_cross_{slug}.png')}")
 
 
 def plot_combined(out_root: Path, log) -> None:
-    """One panel per model that has a summary; layers differ per model, so no shared x."""
     found = sorted(p for p in out_root.glob("*/summary.parquet"))
     if not found:
-        log(f"  no */summary.parquet under {S2.rel_to_root(out_root)}; nothing to plot")
+        log(f"  no */summary.parquet under {DS.rel_to_root(out_root)}; nothing to plot")
         return
     plt = _pyplot()
     widths = [max(4.0, 0.4 * len(pd.read_parquet(p)) + 1.5) for p in found]
@@ -280,14 +232,13 @@ def plot_combined(out_root: Path, log) -> None:
     axes[0][0].set_ylabel("cross cos(d_D, d_R)\nmedian + 95% split-half interval")
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        fig.savefig(out_root / f"step7_combined.{ext}", dpi=200)
+        fig.savefig(out_root / f"splithalf_geometry_cross_combined.{ext}", dpi=200)
     plt.close(fig)
-    log(f"  combined plot -> {S2.rel_to_root(out_root / 'step7_combined.png')} "
+    log(f"  combined plot -> {DS.rel_to_root(out_root / 'splithalf_geometry_cross_combined.png')} "
         f"({len(found)} model(s))")
 
 
 def _selfcheck() -> None:
-    """Cheap invariants, run on every invocation."""
     lab = np.array(["NORMAL"] * 11 + ["DISCLAIMER"] * 5 + ["REFUSAL"] * 4)
     m = stratified_halves(lab, np.random.default_rng(0))
     for c, n in (("NORMAL", 11), ("DISCLAIMER", 5), ("REFUSAL", 4)):
@@ -297,18 +248,18 @@ def _selfcheck() -> None:
          {"layer_row": 1, "steerable": True, "auroc_R_vs_rest": 0.9, "auroc_D_vs_rest": 0.6},
          {"layer_row": 2, "steerable": True, "auroc_R_vs_rest": 0.8, "auroc_D_vs_rest": 0.7},
          {"layer_row": 3, "steerable": True, "auroc_R_vs_rest": 0.8, "auroc_D_vs_rest": 0.9}]
-    assert top_by(t, "auroc_R_vs_rest", 2) == [1, 2]       # tie at 0.8 -> shallower row
+    assert top_by(t, "auroc_R_vs_rest", 2) == [1, 2]
     assert top_by(t, "auroc_D_vs_rest", 2) == [2, 3]
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(description="splithalf_geometry_cross -- split-half geometry: median cross cos(d_D, d_R) with a 95% split-half interval.")
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--stage", choices=("compute", "plot", "all"), default="all")
     ap.add_argument("--models", default=None, help="comma-separated slugs (default: roster)")
     ap.add_argument("--layer-set", choices=("union", "selected", "all"), default="union",
                     help="union = top-k AUROC(R) | top-k AUROC(D) (default); selected = "
-                         "step 2's top-k by mean AUROC; all = every steerable row")
+                         "directions_steering.py's top-k by mean AUROC; all = every steerable row")
     ap.add_argument("--top-k", type=int, default=0, help="default: probe.top_k (10)")
     ap.add_argument("--layers", default=None,
                     help="comma-separated layer rows; overrides --layer-set")
@@ -321,18 +272,18 @@ def main() -> None:
     args = ap.parse_args()
 
     _selfcheck()
-    out_root = G.repo_path("results/reports/step7_cross_smoke" if args.smoke
-                           else "results/reports/step7_cross")
-    log = S2.Tee(out_root / f"step7_{args.stage}.log")
+    out_root = G.repo_path("results/reports/splithalf_geometry_cross_smoke" if args.smoke
+                           else "results/reports/splithalf_geometry_cross")
+    log = DS.Tee(out_root / f"splithalf_geometry_cross_{args.stage}.log")
     try:
         if args.stage in ("compute", "all"):
-            cfg = S2.load_cfg(args.config, args.smoke, log)
+            cfg = DS.load_cfg(args.config, args.smoke, log)
             if args.seed is None:
                 args.seed = int(cfg["study"]["seed"])
             only = [s.strip() for s in args.models.split(",")] if args.models else None
-            ctxs = S2.model_contexts(cfg, only, log)
-            splits = S2.load_study_splits(cfg, log)
-            labels = S2.load_labels(cfg, args.labels, log)
+            ctxs = DS.model_contexts(cfg, only, log)
+            splits = DS.load_study_splits(cfg, log)
+            labels = DS.load_labels(cfg, args.labels, log)
             for ctx in ctxs:
                 compute_model(cfg, ctx, args, splits, labels, out_root, log)
         if args.stage in ("plot", "all"):

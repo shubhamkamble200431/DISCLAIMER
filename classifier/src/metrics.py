@@ -1,8 +1,3 @@
-"""Shared metrics module. Every candidate is scored through exactly these functions.
-
-Min-n discipline (A5): any subgroup claim with support < MIN_N is reported as
-`insufficient_evidence` with n shown, never as a verdict.
-"""
 from __future__ import annotations
 
 import json
@@ -17,13 +12,11 @@ MIN_N = 30
 
 
 def evidence(n, value):
-    """Wrap a subgroup statistic with its support and an evidence verdict."""
     return {"n": int(n), "value": value,
             "evidence": "ok" if n >= MIN_N else "insufficient_evidence"}
 
 
 def classification_metrics(y_true, y_pred, y_prob=None, labels=LABELS3):
-    """y_true / y_pred are integer class ids indexed into `labels`."""
     from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
                                  log_loss, precision_recall_fscore_support)
 
@@ -55,34 +48,16 @@ def classification_metrics(y_true, y_pred, y_prob=None, labels=LABELS3):
             "support": int(s[i]),
             "evidence": "ok" if s[i] >= MIN_N else "insufficient_evidence",
         }
-    # headline
     out["disclaimer_f1"] = out["per_class"]["DISCLAIMER"]["f1"]
     if y_prob is not None:
         y_prob = np.asarray(y_prob)
         finite = bool(np.isfinite(y_prob).all())
         out["probs_finite"] = finite
-        # A collapsed/diverged run can produce NaN/inf probabilities; log_loss()
-        # raises ValueError on those rather than returning a value. macro_f1 /
-        # accuracy above are computed from y_pred (already-taken argmax), so they
-        # stay meaningful and the run still gets a real metrics.json instead of
-        # dying here -- see README's "read the numbers" section on collapsed runs.
         out["log_loss"] = float(log_loss(y_true, y_prob, labels=ids)) if finite else None
     return out
 
 
 def label_geometry(emb, labels, label_names=LABELS3, pooling=None):
-    """Centroid geometry of a labelled embedding matrix.
-
-    Reports, per label pair, the Euclidean distance between the two class centroids
-    and the cosine similarity between them. Pair numbers alone are not readable --
-    a distance of 3.0 means nothing without knowing how wide the classes are -- so
-    each class also carries its intra-class spread, and each pair carries a
-    `separation` ratio of centroid distance to the mean of the two spreads. Ratio > 1
-    means the centroids are further apart than the classes are wide.
-
-    Min-n discipline (A5) applies: a class with support < MIN_N is marked
-    `insufficient_evidence`, and any pair touching such a class inherits that mark.
-    """
     emb = np.asarray(emb, dtype=np.float64)
     labels = np.asarray(labels)
     if emb.ndim != 2:
@@ -178,7 +153,6 @@ def majority_floor(y_true, labels=LABELS3, majority_id=0):
 
 
 def aggregate_seeds(runs):
-    """runs: list of metrics dicts -> mean/std over the scalar headline numbers."""
     keys = ["macro_f1", "weighted_f1", "accuracy", "disclaimer_f1"]
     agg = {}
     for k in keys:

@@ -1,328 +1,106 @@
-# Single config for the whole refusal/disclaimer direction + causal-steering study
-# (plan.md steps 1-4). Consumed by scripts/step1_generate_label_split.py,
-# step2_directions_steering.py, step3_geometry.py and step4_ood_mozilla.py.
-#
-# All paths are repo-relative (refusal_generation/), resolved through G.repo_path().
-# The `models` block keeps configs/generate.yaml's schema EXACTLY, so G.parse_models()
-# works on this file unchanged -- every key there is a ModelSpec field.
-
 study:
-  # One seed for the whole pipeline: split assignment, balanced-subsample draws, probe
-  # CV folds, bootstrap resampling. Every committed artifact records it.
   seed: 42
-
-  # ONE shared prompt partition for all models (not per-model), so cross-model claims
-  # are possible at all. --partition per-model is the alternative mode.
-  #   Direction  40%  where d_R / d_D are estimated
-  #   Probing    20%  where the top-10 layers are selected
-  #   Steering   40%  where steering runs and the pp change is measured
-  # No held-out validation split (user decision 2026-09-22): the three splits cover all
-  # 1,750 prompts.
   split_fractions:
     direction: 0.40
     probing: 0.20
     steering: 0.40
-  partition: shared           # shared | per-model
-  # Stratify on the label TRIPLE (model1, model2, model3) crossed with C*'s own
-  # train/val/test split, allocated by largest remainder with seeded tie-breaking.
-  # Per-model class counts inside each split WILL differ between models -- that is
-  # expected and every step's output must state it rather than hide it.
+  partition: shared
   stratify_on: [label_triple, cstar_split]
-
-  # The canonical label order. Must equal refusal_classifier src.metrics.LABELS3; the
-  # scoring stages assert this rather than trusting the copy.
   labels3: [NORMAL, DISCLAIMER, REFUSAL]
-  min_n: 30                   # the project's min-n rule (M.MIN_N): no cell reported below it
-
-  # C* is the Longformer run ONLY (locked decision). predict.py's DEFAULT_RUNS lists
-  # modernbert first, so every call passes this run dir explicitly.
-  classifier_run_dir: ../refusal_classifier/results/runs/longformer_42_20260916-160022
-  classifier_repo: ../refusal_classifier
-  # 1,223 of the 1,750 prompts are in C*'s own training split, so every headline is
-  # ALSO reported on the subset where cstar_split == 'test'.
+  min_n: 30
+  classifier_run_dir: ../classifier/results/runs/longformer_42_20260916-160022
+  classifier_repo: ../classifier
   report_cstar_test_clean: true
-
-  # Paired over prompt ids. ONE shared [B, n_prompts] resample index is drawn per model
-  # and reused across every condition: a fresh np.random.choice per condition costs
-  # ~4 CPU-hours per model, the shared index costs minutes, and pairing is what makes
-  # the CI on a difference correct in the first place.
   bootstrap:
     B: 10000
     ci: 0.95
     method: percentile
     shared_index: true
-
 prompts:
-  # Identical to configs/generate.yaml. The parquets hold 2 rows per prompt (side a/b);
-  # build_prompt_table() dedupes to 1,750 unique prompts.
   splits:
     train: data/processed/train.parquet
     val:   data/processed/val.parquet
     test:  data/processed/test.parquet
   id_column: prompt_id
   text_column: prompt
-
 output:
-  # `root` is the alias G.model_dirs(cfg["output"]["root"], slug) reads, so step 1 can
-  # drive src/generate.py's writers off this file without a shim.
   root: data/generated
-  generated_root: data/generated     # step 1: answers + prompt_last activations
-  study_root: data/study             # splits, directions, layer selection, metrics
-  steered_root: data/steered         # step 2: <model>/<condition>/answers.jsonl
-  ood_root: data/ood                 # step 4: Mozilla disclaimer eval
-
-  # stacked -> hidden/<prompt_id>.npz holding [n_layer_rows, hidden] per capture point.
-  # per_layer would write ~58k files per model (33 rows x 1750 prompts) and makes the
-  # tree unscannable on Windows for the same bytes. load_hidden/load_layer_matrix read
-  # either layout, so this is purely a file-count decision.
+  generated_root: data/generated
+  study_root: data/study
+  steered_root: data/steered
   hidden_layout: stacked
-  compress: false             # ~halves size, costs ~10ms/prompt; not worth it at this scale
-  store_dtype: float16        # auto-promoted to float32 per array if fp16 would overflow
-
+  compress: false
+  store_dtype: float16
 capture:
-  # Row l is the OUTPUT of decoder block l-1; row 0 is inputs_embeds and row n_blocks is
-  # post-final-norm. All rows are STORED (cheap) but only 1..n_blocks-1 are analysable or
-  # steerable -- a loop over "all layers" that includes row 0 emits NaN.
   layers: all
   points:
-    # THE capture point: hidden_states[0][l][0, -1, :] from the prefill, i.e. the final
-    # token of the fully chat-formatted prompt immediately before the first generated
-    # token. Independent of max_new_tokens.
     - prompt_last
   last_k_prompt_tokens: 0
-
 generation:
-  # 1024 (REVERTED back 2026-09-22 to the original locked value; briefly set to 512
-  # to reuse phase-1 data, reverted again to generate fresh instead) because a
-  # truncated answer is scored on a fragment, and the DISCLAIMER class in particular
-  # tends to be long. Costs ~1.4x the wall time vs 512.
   max_new_tokens: 1024
-  do_sample: false            # greedy: no within-cell variance, so error bars come from
-                              # the paired bootstrap over prompt ids, never from reruns
-  seed: 42                    # only meaningful if do_sample is ever turned on
-
+  do_sample: false
+  seed: 42
 directions:
-  # EXACTLY TWO directions: d_R = unit(mu_R - mu_N), d_D = unit(mu_D - mu_N). No d_D_perp.
   names: [dR, dD]
-  method: dim                 # difference in means
-  # Balanced difference-of-means (the PDF's "sampling approach to negate the class size
-  # mismatch"): subsample NORMAL down to min(n_R, n_D), take the UNIT difference vector,
-  # repeat over K seeded draws, average the unit vectors and renormalise. Averaging the
-  # unit vectors -- not the raw differences -- is what keeps one lucky draw with a large
-  # norm from dominating.
+  method: dim
   balance_draws: 50
-  balance_target: min_RD      # subsample NORMAL to min(n_R, n_D)
-  estimated_on: direction     # the 40% Direction split, using each model's OWN C* label
-
+  balance_target: min_RD
+  estimated_on: direction
 probe:
-  # Top 10 layers per model by mean(AUROC(R vs rest), AUROC(D vs rest)) from a LINEAR
-  # probe (standardised logistic regression, 5-fold CV) on the 20% Probing split.
-  # Linear because the thing being steered is a single direction: a probe that needs a
-  # nonlinearity is reporting separability the intervention cannot exploit.
-  criterion: mean_auroc_R_vs_rest_D_vs_rest
+  criterion: union_top_k_auroc_R_vs_rest_and_D_vs_rest
   folds: 5
   top_k: 10
-  # Selection considers rows 1..n_blocks-1 ONLY. Row 0 is byte-identical across prompts
-  # (no direction exists there) and row n_blocks is post-final-norm, not a residual site.
-  # Both are still scored and reported for completeness, just never selected.
   steerable_rows_only: true
-
 steering:
-  # h' = h + alpha * d_hat, applied ONCE at the last prefill token position, before the
-  # first generated token. Generated tokens are not steered; the effect propagates
-  # through the KV cache.
   positions: prefill_last
   directions: [dR, dD]
-  # 10 non-zero alphas. alpha=0 is generated ONCE per model as the SHARED baseline,
-  # through the identical batched code path with identical batch membership -- batched
-  # greedy decoding is not bitwise invariant to batch size.
   alphas: [-20, -10, -5, -2, -1, 0, 1, 2, 5, 10, 20]
   baseline_alpha: 0
-  # Every plot and table puts alpha / sigma_l on the x-axis, never raw alpha. sigma_l is
-  # the sd of the Direction-split activations at layer l projected onto the direction.
-  # Raw alpha is the sampling grid only.
   x_axis: alpha_over_sigma
-
-  # Main-paper transition bar graph (user decision 2026-09-22): the top 5 of the 10
-  # steered layers, ranked PER DIRECTION by peak target-class pp on the FULL Steering
-  # split -- d_D by its largest DISCLAIMER pp over all alphas, d_R by its largest REFUSAL
-  # pp. This picks FIGURE PANELS only: steering, every metric, every table and the
-  # per-layer appendix figures still cover all 10 layers. Because the 5 are chosen on
-  # the same prompts they are plotted on, the caption must say "top 5 by peak pp".
   main_figure:
     top_n_layers: 5
     rank_subset: full
-
-  # 32 (up from 8, user decision 2026-09-22): push toward the A100-40GB's actual
-  # ceiling to cut steer wall-clock. generate()'s own OOM handler halves a batch
-  # and retries (src/steer.py::BatchedGenerator._run_batch), but that is a
-  # last-resort fallback, not a free lunch -- a halved batch's rows drop out of
-  # the static-membership guarantee the alpha=0 baseline comparison depends on
-  # (batched greedy decoding is not bitwise-reproducible across batch sizes).
-  # If OOM halving fires for a model, the clean fix is to re-run that model at
-  # a lower --batch-size, not to trust the halved rows.
-  batch_size: 32              # settable down to 1; requires sdpa or flash_attention_2.
-                              # An eager-pinned model warns loudly and clamps to 4.
-  padding_side: left          # index -1 is then the real final token for every row
+  batch_size: 1
+  padding_side: left
   bucket_by_length: true
-  static_batch_membership: true   # the tail shard is PADDED, never shrunk
-  max_prompt_tokens: null     # null = no cap (sdpa/fa2); eager forces 2048
-
-  # Steered output is answers.jsonl ONLY -- 700 prompts x 200 conditions x 3 models
-  # would be 420,000 per-prompt JSON files.
+  static_batch_membership: true
+  max_prompt_tokens: null
   output_format: answers_jsonl
-  save_activations: false     # nothing is captured here, which is why batching is legal
-
-  # Metrics are defined on the ARGMAX LABEL only: dynamic batch composition in the
-  # classifier shifts probabilities by up to 0.023, which would leak into any
-  # probability-based statistic. Scoring imports load_classifier/predict ONCE per
-  # process and appends parquet shards.
+  save_activations: false
   scoring:
     metric_basis: argmax_label
     shard_rows: 20000
-    val_parity_gate: true     # run once at process startup, abort on failure
-
-  # Random-direction control: implemented behind --control random-unit --control-draws K
-  # (a random vector L2-matched to the found direction), but OFF and generating nothing.
+    val_parity_gate: true
   control:
     enabled: false
     kind: random-unit
     draws: 5
-
-ood:
-  # Out-of-distribution check on a disclaimer-specific eval set. The revision is pinned
-  # so the OOD numbers are reproducible even if the dataset is updated upstream.
-  hf_id: Mozilla/sensitive-topic-disclaimer-eval
-  config_name: disclaimer
-  revision: 9a607f0874fe4302373983ea17c50b33f8aa7744
-  # OOD prompt_ids are offset far above the 1,750 in-distribution ids so the two can be
-  # concatenated without collision and any leak is obvious on sight.
-  id_offset: 9000000000
-  # DEFAULT GRID = IN-DOMAIN PARITY (user decision 2026-09-21): each model's OWN top-10
-  # layers from step 2 x the full steering.alphas grid, so the OOD pp is directly
-  # comparable with the in-domain pp cell for cell. ~174,870 generations for 3 models,
-  # ~218 GPU-h at batch 8 -- run as the sharded array 42_step4_steer_dgx.slurm.
-  layers_top: 10              # take the model's top-N selected layers (10 = all of them)
-  alphas: inherit             # 'inherit' = steering.alphas; or an explicit list
-  directions: [dR, dD]
-  # --reduced: the cheap transfer check (~21,750 generations, ~27 GPU-h at batch 8).
-  reduced:
-    layers_top: 3
-    alphas: [-10, -5, 5, 10]
-
-# -----------------------------------------------------------------------------
-# Generation roster: 3 models, config-driven. Every key below is a ModelSpec field
-# (name, hf_id, dtype, device_map, attn_implementation, system_prompt,
-#  chat_template_kwargs, generation, load_kwargs, trust_remote_code, note), so
-# G.parse_models(cfg) parses this block with no changes.
-#
-# `name` is what G.slugify() turns into the on-disk slug ('qwen3.5-4b' -> 'qwen3-5-4b').
-#
-#   qwen3-5-4b            Qwen/Qwen3.5-4B    hidden 2560  32 blocks (33 rows)
-#   qwen3-5-9b            Qwen/Qwen3.5-9B    hidden 4096  32 blocks (33 rows)
-#   olmo3-7b              allenai/Olmo-3-7B-Instruct  hidden 4096  32 blocks (33 rows)
-#
-# Roster set 2026-09-22: Nemotron is OUT, Qwen3.5-4B is back. Two of the three models
-# are now the same family and generation, so 4B vs 9B is a SCALE comparison and OLMo-3
-# is the only cross-family contrast.
-#
-# SYSTEM PROMPT RULE, one rule for all three: system_prompt is null, i.e. no
-# user-supplied system prompt, and each model's CHAT-TEMPLATE DEFAULT applies. Measured
-# 2026-09-21 by rendering each template with no system message:
-#   qwen      no system turn; enable_thinking=false keeps the think block empty
-#   olmo3     template injects 'You are a helpful function-calling AI assistant. You do
-#             not currently have access to any functions. <functions></functions>'
-#
-# Gemma is discarded (its eager-only softcapping made it the one model that could not
-# be batched safely, which is exactly the stage this study spends 5 days in).
-# -----------------------------------------------------------------------------
 models:
   - name: qwen3.5-4b
-    # https://huggingface.co/Qwen/Qwen3.5-4B   (ungated, 4.7B params on disk)
     hf_id: Qwen/Qwen3.5-4B
-    dtype: bfloat16
-    device_map: auto
-    attn_implementation: sdpa
-    system_prompt: null       # no system prompt: measure the model's OWN refusal behaviour
-    chat_template_kwargs:
-      enable_thinking: false  # hybrid-reasoning template; keep answers free of think traces
-
-  - name: qwen3.5-9b
-    # https://huggingface.co/Qwen/Qwen3.5-9B   (ungated, 9.7B params on disk)
-    hf_id: Qwen/Qwen3.5-9B
     dtype: bfloat16
     device_map: auto
     attn_implementation: sdpa
     system_prompt: null
     chat_template_kwargs:
-      enable_thinking: false  # hybrid-reasoning template; keep answers free of think traces
-
+      enable_thinking: false
   - name: olmo3-7b
-    # https://huggingface.co/allenai/Olmo-3-7B-Instruct  (ungated, apache-2.0, Nov 2025)
-    # Olmo3ForCausalLM, hidden 4096, 32 blocks, native in transformers (no remote code).
-    # sdpa and flash_attention_2 both supported, so the batched steer path applies.
     hf_id: allenai/Olmo-3-7B-Instruct
     dtype: bfloat16
     device_map: auto
     attn_implementation: sdpa
     system_prompt: null
-    note: >
-      The only non-Qwen FAMILY (Allen AI post-training): the cross-family contrast to
-      the Qwen 4B/9B scale pair. With no system message its chat template injects a
-      DEFAULT persona: "You are a helpful function-calling AI assistant. You do not
-      currently have access to any functions." That is the model's own default and is
-      kept under the one-rule-for-all policy above, but it is text the other two models
-      never see and may raise technical refusals ("I don't have access to ..."). To
-      neutralise it, set an explicit system_prompt here -- note an EMPTY string does
-      not work, because src/generate.py only adds a system turn when it is truthy.
-      Capture token is the newline after '<|im_start|>assistant'. Layers 1..31 are
-      steerable; 3 of every 4 blocks use a 4096-token sliding window.
 
-# --smoke / --limit swap in this roster and cap the prompt count, so the whole 4-step
-# pipeline can be exercised end to end on a laptop GPU before a SLURM job is queued.
-# Exercises all four steps end to end on a laptop GPU before any DGX time is queued.
-# Every output root gets a `_smoke` suffix (src/steer.py::apply_smoke_paths), so a smoke
-# run can never touch the real artifacts.
 smoke:
-  # 8 prompts was too few to be a real test: a small model answers most arena prompts
-  # plainly, so the Direction split would hold zero REFUSAL and zero DISCLAIMER and the
-  # difference-of-means would be undefined -- the steering path would never be reached.
-  # 64 prompts at the observed ~30% combined D+R base rate gives roughly 10 of each.
-  # 64 was still too thin downstream: the Probing split was 15% of it, i.e. 9 prompts with
-  # one DISCLAIMER and one REFUSAL, and a 5-fold out-of-fold AUROC needs more than one
-  # positive per class. 256 gives Direction ~102 and Probing ~51, which exercises the probe
-  # and the steering sweep for ~10 min of laptop GPU.
-  #
-  # 2026-09-23 (real-roster smoke, user decision): back to 256 prompts, but
-  # max_new_tokens now matches the REAL run's 1024 (was 128) so this smoke also
-  # exercises real generation length/memory behavior, not just plumbing. Job 8555
-  # hit "0 scorable steerable rows" for qwen3.5-4b at 256 prompts (only 2/46
-  # DISCLAIMER in the Probing split, below the 3-fold CV minimum) -- rather than
-  # inflate n_prompts again, probe.folds below drops 3 -> 2 (needs only 2 positives
-  # per class), which survives this exact count.
   n_prompts: 256
   generation:
-    # 1024, matching configs/study.yaml's real generation.max_new_tokens -- this
-    # smoke now also validates real per-model memory/timing behavior at the actual
-    # token budget, not a cheap 128-token placeholder. Costs ~8x the wall time of
-    # the previous 128-token smoke.
     max_new_tokens: 1024
   steering:
     alphas: [-5, 0, 5]
-    batch_size: 8
+    batch_size: 1
   probe:
-    folds: 2          # dropped from 3 (2026-09-23): survives as few as 2 positives
-                      # per class, which is what 256 prompts actually produced for
-                      # qwen3.5-4b's DISCLAIMER count on job 8555's slice.
-    # 2 layers, not 10: the smoke proves the plumbing, not the science. Keeps the sweep
-    # at 64 x 2 layers x 2 directions x 2 non-zero alphas + 64 baseline = 576 generations.
+    folds: 2
     top_k: 2
-  # Models swapped 2026-09-22 (user decision): the REAL 3-model roster, not a tiny
-  # throwaway model. This costs real GPU time on 4B/9B/7B-parameter models instead of
-  # a laptop-friendly 1B one, but validates actual roster behavior (real chat
-  # templates, real per-model memory footprint) at smoke scale. Output still lands
-  # under the isolated `_smoke` paths (src/steer.py::apply_smoke_paths), so this
-  # still cannot touch or contaminate the real (non-smoke) data.
   models:
     - name: qwen3.5-4b
       hf_id: Qwen/Qwen3.5-4B
@@ -332,16 +110,6 @@ smoke:
       system_prompt: null
       chat_template_kwargs:
         enable_thinking: false
-
-    - name: qwen3.5-9b
-      hf_id: Qwen/Qwen3.5-9B
-      dtype: bfloat16
-      device_map: auto
-      attn_implementation: sdpa
-      system_prompt: null
-      chat_template_kwargs:
-        enable_thinking: false
-
     - name: olmo3-7b
       hf_id: allenai/Olmo-3-7B-Instruct
       dtype: bfloat16

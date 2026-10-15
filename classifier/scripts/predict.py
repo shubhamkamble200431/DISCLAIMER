@@ -1,24 +1,3 @@
-"""Classify responses with trained holdout checkpoints. Inference only; GPU jobs run
-SEQUENTIALLY (one classifier loaded at a time).
-
-Every --run is used independently -- there is no ensembling. For each run:
-  1. re-predict val and compare against the run's saved val_probs.npy. This proves the
-     checkpoint, tokenizer and truncation were restored exactly; a mismatch aborts.
-  2. score the test split (never touched by training or model selection)
-  3. classify the generated answers (<generated>/<gen_model>/answers.jsonl)
-
-Outputs (under --out):
-  <candidate>/val_parity.json, <candidate>/test_metrics.json
-  test_predictions.parquet          test split, one column set per classifier
-  generated_predictions.parquet     generated answers, one column set per classifier
-  generated_predictions.csv         same, utf-8-sig so Excel opens it cleanly
-  disagreements.csv                 generated answers where the classifiers disagree
-  summary.json
-
-Usage (PowerShell):
-  python -X utf8 scripts/predict.py --smoke
-  python -X utf8 scripts/predict.py
-"""
 from __future__ import annotations
 
 import argparse
@@ -33,13 +12,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import data as D       # noqa: E402
-from src import metrics as M    # noqa: E402
-from src import train as T      # noqa: E402
+from src import data as D
+from src import metrics as M
+from src import train as T
 
-DEFAULT_RUNS = ["results/runs/modernbert_large_42_20260916-145535",
-                "results/runs/longformer_42_20260916-160022"]
-DEFAULT_GENERATED = "../refusal_generation/data/generated"
+DEFAULT_RUNS = ["results/runs/longformer_42_20260916-160022"]
+DEFAULT_GENERATED = "../generation/data/generated"
 SMOKE_N = 48
 MIN_VAL_AGREEMENT = 0.99
 
@@ -55,18 +33,12 @@ class Tee:
         self.f.flush()
 
 
-# --------------------------------------------------------------------------- #
-# model
-# --------------------------------------------------------------------------- #
 def load_classifier(run_dir, device, log):
     cfg = json.loads((run_dir / "config_snapshot.json").read_text(encoding="utf-8"))["config"]
     m, t = cfg["model"], cfg["train"]
     tok = T.load_tokenizer(cfg, run_dir / "tokenizer")
     T.check_special_tokens(tok, log)
 
-    # Same config construction as train_encoder(); weights come from best_state.pt,
-    # so only the base config is needed, not the base checkpoint. LoRA runs saved
-    # merged weights, so they load here like any full fine-tune.
     conf = T.load_model_config(cfg, tok)
     model = T.load_classifier_model(cfg, conf, pretrained=False)
     state = torch.load(run_dir / "best_state.pt", map_location="cpu")
@@ -83,22 +55,16 @@ def load_classifier(run_dir, device, log):
 
 
 def predict(texts, cfg, tok, model, device, amp_dtype, token_budget):
-    """Softmax probs in input order. Batches are length-sorted and capped at
-    token_budget padded tokens so long responses do not OOM an 8 GB card."""
     m, t = cfg["model"], cfg["train"]
     max_length = int(m["max_length"])
     ids = T.encode(texts, tok, max_length, t.get("truncation", "head"), m.get("prefix", ""))
 
-    # Longformer pads every batch up to a multiple of its attention window inside
-    # forward(), so budget against the padded width -- otherwise a batch of ~520-token
-    # rows is really twice the size the budget allowed, and OOMs.
     window = getattr(model.config, "attention_window", None)
     pad_to = max(window) if isinstance(window, (list, tuple)) else (window or 1)
 
     order = np.argsort([-len(x) for x in ids], kind="stable")
     batches, cur = [], []
     for i in order:
-        # descending lengths: the first item of a batch is its longest
         width = -(-len(ids[cur[0] if cur else i]) // pad_to) * pad_to
         if cur and width * (len(cur) + 1) > token_budget:
             batches.append(cur)
@@ -118,9 +84,6 @@ def predict(texts, cfg, tok, model, device, amp_dtype, token_budget):
     return probs, n_truncated
 
 
-# --------------------------------------------------------------------------- #
-# inputs
-# --------------------------------------------------------------------------- #
 def load_generated(root, n=None):
     frames = []
     for d in sorted(p for p in root.iterdir() if (p / "answers.jsonl").exists()):
@@ -151,11 +114,10 @@ def pct_table(df, by, col):
                      for lab in M.LABELS3} for k, row in counts.iterrows()}
 
 
-# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", action="append", default=None,
-                    help="holdout run dir (repeatable); default: modernbert_large + longformer")
+                    help="holdout run dir (repeatable); default: longformer")
     ap.add_argument("--generated", default=DEFAULT_GENERATED)
     ap.add_argument("--out", default=None)
     ap.add_argument("--token-budget", type=int, default=16384,
@@ -199,7 +161,6 @@ def main():
             torch.cuda.reset_peak_memory_stats()
         rec = {"run_dir": run_dir.name, "model": cfg["model"]["name"]}
 
-        # 1. val parity against the probabilities saved at training time
         t0 = time.perf_counter()
         pv, _ = predict(val["response_text"].tolist(), cfg, tok, model, device, amp,
                         args.token_budget)
@@ -218,7 +179,6 @@ def main():
                 f"{agree:.2%} of rows -- checkpoint or tokenisation not restored correctly.")
         rec["val_parity"] = parity
 
-        # 2. test
         pt, _ = predict(test["response_text"].tolist(), cfg, tok, model, device, amp,
                         args.token_budget)
         tm = M.classification_metrics(test["label_id"], pt.argmax(1), pt)
@@ -229,7 +189,6 @@ def main():
         rec["test"] = {k: tm[k] for k in ("n", "accuracy", "macro_f1", "disclaimer_f1",
                                           "log_loss")}
 
-        # 3. generated answers
         t1 = time.perf_counter()
         pg, n_trunc = predict(gen["answer"].tolist(), cfg, tok, model, device, amp,
                               args.token_budget)
@@ -249,10 +208,6 @@ def main():
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    # ----------------------------------------------------------------------- #
-    # write + summarise (per classifier; agreement is reported, never combined)
-    # ----------------------------------------------------------------------- #
-    # With two classifiers this is plain pairwise agreement; with more it is "all agree".
     a, b = names[0], names[-1]
     for df in (test_out, gen_out):
         labels = df[[f"{c}_label" for c in names]]

@@ -1,15 +1,3 @@
-"""Train one transformer candidate. GPU jobs must be run SEQUENTIALLY, never in parallel.
-
-Modes:
-  --split-mode holdout   train on data/processed/train.parquet, early-stop on val.parquet
-                         (used for hyperparameter freezing; test never touched)
-  --split-mode cv        grouped 5-fold CV over data/processed/cv_pool.parquet, writing
-                         out-of-fold predictions
-
-Usage (PowerShell):
-  python -X utf8 scripts/train_transformer.py --config configs/deberta_v3.yaml --smoke
-  python -X utf8 scripts/train_transformer.py --config configs/deberta_v3.yaml --seed 42
-"""
 from __future__ import annotations
 
 import argparse
@@ -25,9 +13,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import data as D       # noqa: E402
-from src import metrics as M    # noqa: E402
-from src import train as T      # noqa: E402
+from src import data as D
+from src import metrics as M
+from src import train as T
 
 
 class Tee:
@@ -99,7 +87,6 @@ def run_holdout(cfg, seed, smoke, run_dir, log):
 
 
 def load_all_labelled(log):
-    """train + val + test concatenated. Used only by --split-mode all."""
     proc = D.repo_path("data/processed")
     parts = []
     for split in ("train", "val", "test"):
@@ -114,7 +101,6 @@ def load_all_labelled(log):
 
 
 def resolve_hparams(args, cfg, log):
-    """lr/epochs for --split-mode all: explicit flags, or read from a prior run."""
     lr, epochs, src = args.lr, args.epochs, "command line"
     if args.from_run:
         rd = D.repo_path(args.from_run)

@@ -1,14 +1,3 @@
-"""Transformer training harness. One code path, driven entirely by configs/*.yaml.
-
-Plain PyTorch loop (no Trainer) so the early-stopping criterion, the loss mode and the
-cost instrumentation are explicit and identical for every candidate.
-
-Candidate kinds:
-  encoder       fine-tuned AutoModelForSequenceClassification
-  decoder       same, for decoder-only LMs (EOS as pad, last-token head); optional
-                train.lora block trains adapters + head, merged before saving
-  frozen_embed  frozen encoder -> masked mean-pool -> L2-norm -> LR / MLP head
-"""
 from __future__ import annotations
 
 import json
@@ -29,9 +18,6 @@ import torch.nn.functional as F
 from src.metrics import LABELS3, classification_metrics, label_geometry
 
 
-# --------------------------------------------------------------------------- #
-# environment
-# --------------------------------------------------------------------------- #
 def print_env():
     print("-" * 78)
     print(f"torch.__version__              : {torch.__version__}")
@@ -73,17 +59,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-# --------------------------------------------------------------------------- #
-# model loading
-# --------------------------------------------------------------------------- #
 def install_swiglu_shim():
-    """Provide xformers.ops.SwiGLU in plain PyTorch.
-
-    NeoBERT's remote code hard-imports it, and the xformers build NeoBERT pins
-    targets torch 2.5, which has no sm_120 kernels. Same parameter names (w12 packed
-    gate+up, w3 down) and the same math as xformers' eager op, so the checkpoint
-    loads with no missing or unexpected keys -- check_candidate.py verifies that.
-    """
     import sys
     import types
     if "xformers.ops" in sys.modules:
@@ -111,9 +87,6 @@ def install_swiglu_shim():
 
 
 def _hub_kwargs(m):
-    """from_pretrained kwargs for a config's model block. Installs the SwiGLU shim
-    first when asked: even the tokenizer imports remote model code (for its config
-    class), and transformers checks that code's imports before running it."""
     if m.get("xformers_shim"):
         install_swiglu_shim()
     return {"trust_remote_code": bool(m.get("trust_remote_code", False)),
@@ -121,12 +94,6 @@ def _hub_kwargs(m):
 
 
 def load_tokenizer(cfg, path=None):
-    """Tokenizer for cfg's model, or the copy saved in a run dir.
-
-    Decoder checkpoints (GPT-2, Llama) ship without a pad token, so EOS doubles as
-    pad. Their classification heads pool the last token whose id != pad_token_id;
-    neither tokenizer appends EOS, so right padding never hides a real token.
-    """
     from transformers import AutoTokenizer
     m = cfg["model"]
     kw = _hub_kwargs(m)
@@ -150,12 +117,6 @@ def load_model_config(cfg, tok):
 
 
 def load_classifier_model(cfg, conf, pretrained=True, loading_info=False):
-    """Always fp32 master weights; bf16 comes from autocast only.
-
-    transformers 5.x from_pretrained defaults to the checkpoint's own dtype.
-    DeBERTa-v3 ships fp16 (TinyLlama bf16), so without this AdamW updates half-
-    precision weights -- which is why every deberta_v3* run on 2026-09-16 diverged.
-    """
     from transformers import AutoModelForSequenceClassification
     m = cfg["model"]
     kw = _hub_kwargs(m)
@@ -165,15 +126,8 @@ def load_classifier_model(cfg, conf, pretrained=True, loading_info=False):
     out = AutoModelForSequenceClassification.from_pretrained(
         m["name"], config=conf, dtype=torch.float32, output_loading_info=loading_info, **kw)
     if cfg["train"].get("head_init") == "zeros":
-        # GPT-2's final hidden states carry a few activations in the hundreds, so a
-        # std-0.02 random `score` head starts with logit gaps near 10 (loss ~13, not
-        # ln 3), and AdamW at lr 1e-5 moves each weight too slowly to undo it.
         nn.init.zeros_((out[0] if loading_info else out).score.weight)
     if kw["trust_remote_code"]:
-        # from_pretrained builds on the meta device and zero-fills buffers that are
-        # not in the checkpoint; transformers re-derives them only for its own
-        # architectures. NeoBERT's RoPE table is one -- all-zero rotations erase
-        # every attention score. Take them from an eagerly built copy instead.
         model = out[0] if loading_info else out
         fresh = load_classifier_model(cfg, conf, pretrained=False)
         for name, buf in nonpersistent_buffers(fresh).items():
@@ -184,17 +138,14 @@ def load_classifier_model(cfg, conf, pretrained=True, loading_info=False):
 
 
 def nonpersistent_buffers(model):
-    """Buffers rebuilt in __init__ rather than loaded from the checkpoint."""
     saved = set(model.state_dict())
     return {n: b for n, b in model.named_buffers() if n not in saved}
 
 
 def apply_lora(model, spec, log=print):
-    """LoRA adapters on the listed linear layers; PEFT's SEQ_CLS task trains the
-    classification head (`score`) in full alongside them."""
     from peft import LoraConfig, TaskType, get_peft_model
     if getattr(model, "is_gradient_checkpointing", False):
-        model.enable_input_require_grads()     # frozen embeddings + checkpointing
+        model.enable_input_require_grads()
     model = get_peft_model(model, LoraConfig(
         task_type=TaskType.SEQ_CLS, r=int(spec.get("r", 16)),
         lora_alpha=int(spec.get("alpha", 32)), lora_dropout=float(spec.get("dropout", 0.05)),
@@ -207,22 +158,10 @@ def apply_lora(model, spec, log=print):
 
 
 def hidden_position(cfg):
-    """Which token the classification head reads: [CLS] at 0 for encoders, the last
-    real token for decoders."""
     return "last" if cfg["kind"] == "decoder" else "first"
 
 
-# --------------------------------------------------------------------------- #
-# tokenisation
-# --------------------------------------------------------------------------- #
 def special_affixes(tokenizer):
-    """The ids a tokenizer wraps a single sequence in, as (prefix, suffix).
-
-    transformers v5 removed build_inputs_with_special_tokens, so derive the affixes
-    by diffing a probe encoded with and without special tokens. Also serves as the
-    check that the tokenizer adds them at all: transformers 5.2.0 ships a
-    DebertaV2Tokenizer that silently adds none (see requirements.txt).
-    """
     probe = tokenizer("x", add_special_tokens=False)["input_ids"]
     full = tokenizer("x", add_special_tokens=True)["input_ids"]
     if probe:
@@ -233,11 +172,6 @@ def special_affixes(tokenizer):
 
 
 def check_special_tokens(tokenizer, log=print):
-    """Warn loudly if the tokenizer adds no special tokens but declares a CLS/BOS.
-
-    An encoder classification head pools position 0; without [CLS] that position is
-    a content token and the run is silently degraded rather than failing.
-    """
     pre, suf = special_affixes(tokenizer)
     log(f"    special tokens: prefix={pre} suffix={suf}")
     if not pre and getattr(tokenizer, "cls_token_id", None) is not None:
@@ -249,7 +183,6 @@ def check_special_tokens(tokenizer, log=print):
 
 
 def encode(texts, tokenizer, max_length, truncation="head", prefix=""):
-    """truncation: 'head' (default) or 'head_tail' (first+last, joined by sep)."""
     texts = [prefix + str(t) for t in texts]
     if truncation == "head":
         return tokenizer(texts, truncation=True, max_length=max_length,
@@ -258,10 +191,9 @@ def encode(texts, tokenizer, max_length, truncation="head", prefix=""):
     if truncation != "head_tail":
         raise ValueError(f"unknown truncation mode: {truncation}")
 
-    # head_tail: keep first half and last half of the budget, joined by the sep token
     pre, suf = special_affixes(tokenizer)
     n_special = len(pre) + len(suf)
-    budget = max_length - n_special - 1          # -1 for the joining sep
+    budget = max_length - n_special - 1
     head_n = budget // 2
     tail_n = budget - head_n
     raw = tokenizer(texts, add_special_tokens=False, truncation=False,
@@ -302,9 +234,6 @@ def collate(batch, pad_id):
             "labels": torch.tensor([b["label"] for b in batch], dtype=torch.long)}
 
 
-# --------------------------------------------------------------------------- #
-# loss
-# --------------------------------------------------------------------------- #
 def class_weights(labels, mode, n_classes=3, device="cpu"):
     if mode in (None, "none"):
         return None
@@ -329,20 +258,7 @@ def compute_loss(logits, labels, mode, weights, focal_gamma=2.0):
     return F.cross_entropy(logits, labels, weight=weights)
 
 
-# --------------------------------------------------------------------------- #
-# optimizer
-# --------------------------------------------------------------------------- #
 def make_optimizer(model, lr, weight_decay, device, log=print):
-    """AdamW, fused on CUDA.
-
-    NOT a performance tweak. On this environment (torch 2.10.0+cu128 nightly,
-    RTX 5070 Laptop, sm_120) the NON-fused AdamW/Adam paths corrupt DeBERTa-v3
-    parameters to NaN on the very first optimizer step, with finite gradients and
-    finite optimizer state going in. Verified: foreach=True, foreach=False and
-    capturable=True all produce NaN; fused=True and SGD do not; a plain MLP is
-    unaffected. Fused is therefore the correct default here, with an explicit
-    fallback elsewhere. See check_finite_params() for the tripwire.
-    """
     if device == "cuda":
         try:
             opt = torch.optim.AdamW(model.parameters(), lr=lr,
@@ -356,7 +272,6 @@ def make_optimizer(model, lr, weight_decay, device, log=print):
 
 
 def check_finite_params(model, step, where=""):
-    """Fail loudly rather than training on silently to NaN metrics."""
     bad = [n for n, p in model.named_parameters()
            if p.requires_grad and not torch.isfinite(p).all()]
     if bad:
@@ -366,9 +281,6 @@ def check_finite_params(model, step, where=""):
             f"This is the sm_120 non-fused AdamW corruption — check make_optimizer().")
 
 
-# --------------------------------------------------------------------------- #
-# encoder fine-tuning
-# --------------------------------------------------------------------------- #
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype):
     model.eval()
@@ -389,14 +301,6 @@ def evaluate(model, loader, device, amp_dtype):
 @torch.no_grad()
 def encoder_hidden(model, ids, tokenizer, device, amp_dtype, batch_size=32,
                    position="first"):
-    """Final-layer hidden state at position 0 -- the [CLS] vector the classification
-    head pools. This is the representation the decision is actually made from, so it
-    is the one whose label geometry is worth measuring.
-
-    check_special_tokens() guarantees position 0 really is [CLS]; without that guard
-    this would silently pool a content token. position="last" takes the last real
-    token instead, which is what decoder classification heads pool.
-    """
     model.eval()
     ds = IdsDataset(ids, np.zeros(len(ids)))
     loader = torch.utils.data.DataLoader(
@@ -419,12 +323,6 @@ def encoder_hidden(model, ids, tokenizer, device, amp_dtype, batch_size=32,
 
 @torch.no_grad()
 def padding_parity(model, ids, pad_id, device, amp_dtype, log=print, tol=0.02):
-    """Class probabilities for each row scored alone vs inside one right-padded batch.
-
-    A mismatch means the model reads padding: a decoder head pooling a pad token, or
-    remote model code that ignores the attention mask. Raises rather than training a
-    classifier whose output depends on what it was batched with.
-    """
     model.eval()
 
     def probs(rows):
@@ -437,10 +335,6 @@ def padding_parity(model, ids, pad_id, device, amp_dtype, log=print, tol=0.02):
     batched = probs(ids)
     single = torch.cat([probs([x]) for x in ids])
     diff = float((batched - single).abs().max())
-    # A label flip only counts as evidence when the row is not a near-tie. An
-    # untrained model -- every smoke run -- sits within a fraction of a percent of
-    # a three-way tie, where any numeric wobble flips argmax while the
-    # probabilities themselves agree to four decimals.
     top2 = single.topk(2, dim=-1).values
     flips = int(((batched.argmax(1) != single.argmax(1))
                  & (top2[:, 0] - top2[:, 1] > tol)).sum())
@@ -455,14 +349,12 @@ def padding_parity(model, ids, pad_id, device, amp_dtype, log=print, tol=0.02):
 
 
 def varied_lengths(ids, n=8):
-    """n rows spread across the length distribution, shortest to longest."""
     order = np.argsort([len(x) for x in ids], kind="stable")
     return [ids[i] for i in order[np.linspace(0, len(ids) - 1, n).astype(int)]]
 
 
 def throughput_encoder(model, ids, tokenizer, device, amp_dtype, batch_size=32,
                        max_batches=8):
-    """Responses/sec at the given batch size (inference)."""
     model.eval()
     ds = IdsDataset(ids, np.zeros(len(ids)))
     loader = torch.utils.data.DataLoader(
@@ -489,7 +381,6 @@ def throughput_encoder(model, ids, tokenizer, device, amp_dtype, batch_size=32,
 
 
 def train_encoder(cfg, data, seed, run_dir, smoke=False, log=print):
-    """data: dict split -> (texts, labels). Requires 'train' and 'val'; 'test' optional."""
     import gc
 
     set_seed(seed)
@@ -578,11 +469,6 @@ def train_encoder(cfg, data, seed, run_dir, smoke=False, log=print):
                     sched.step()
                     opt.zero_grad(set_to_none=True)
                     n_opt_steps += 1
-                    # Every step, not just the first few: the DeBERTa-v3 instability
-                    # this guards against (see make_optimizer()) was observed to
-                    # corrupt params well past step 3, and a narrow window just lets
-                    # it slide through undetected until it crashes downstream in
-                    # metrics as a confusing "NaN" sklearn error.
                     check_finite_params(model, n_opt_steps, f"(lr={lr:g})")
 
             y, p, pr = evaluate(model, val_loader, device, amp_dtype)
@@ -593,8 +479,6 @@ def train_encoder(cfg, data, seed, run_dir, smoke=False, log=print):
 
             score = mt["disclaimer_f1"]
             if best_lr_run is None or score > best_lr_run["score"] + 1e-9:
-                # LoRA: snapshot only the trained tensors (adapters + head), not a
-                # 4.4 GB copy of the frozen base every time val improves.
                 best_lr_run = {"score": score, "epoch": ep + 1, "metrics": mt,
                                "preds": p, "probs": pr,
                                "state": {k: v.detach().cpu().clone()
@@ -617,8 +501,6 @@ def train_encoder(cfg, data, seed, run_dir, smoke=False, log=print):
             if loaded.unexpected_keys:
                 raise RuntimeError(f"LoRA best state has unexpected keys: "
                                    f"{loaded.unexpected_keys[:3]}")
-            # Fold adapters into the base weights: best_state.pt is then a plain
-            # sequence-classification checkpoint that predict.py loads without peft.
             model = model.merge_and_unload()
         if smoke:
             padding_parity(model, varied_lengths(enc["val"]), tok.pad_token_id, device,
@@ -651,8 +533,6 @@ def train_encoder(cfg, data, seed, run_dir, smoke=False, log=print):
             best["_state"] = best_lr_run["state"] if not lora else \
                 {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best["_tok"] = tok
-        # Nothing downstream uses the live model, and on a 16 GB card the previous
-        # LR's model + optimizer state must be gone before the next one loads.
         del model, opt, sched, best_lr_run
         gc.collect()
         if device == "cuda":
@@ -661,19 +541,7 @@ def train_encoder(cfg, data, seed, run_dir, smoke=False, log=print):
     return best
 
 
-# --------------------------------------------------------------------------- #
-# fit on all labelled data (no held-out split)
-# --------------------------------------------------------------------------- #
 def train_final(cfg, texts, labels, seed, run_dir, lr, epochs, smoke=False, log=print):
-    """Fit an encoder on 100% of the labelled data at a FIXED lr and epoch count.
-
-    There is no held-out split left, so there is deliberately no LR sweep, no early
-    stopping and no best-checkpoint selection: the final epoch's weights are the
-    deliverable. lr and epochs must therefore already be frozen by a holdout run.
-
-    The metrics returned are computed on the training data itself. They describe fit,
-    not generalisation, and must never be quoted as performance.
-    """
     set_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     m, t = cfg["model"], cfg["train"]
@@ -779,12 +647,8 @@ def train_final(cfg, texts, labels, seed, run_dir, lr, epochs, smoke=False, log=
             "n_train_rows": len(texts)}
 
 
-# --------------------------------------------------------------------------- #
-# frozen embeddings (e5)
-# --------------------------------------------------------------------------- #
 @torch.no_grad()
 def embed_frozen(texts, cfg, device=None, batch_size=16, smoke=False):
-    """E5: 'query: ' prefix -> masked mean-pool of last hidden state -> L2 normalise."""
     from transformers import AutoModel, AutoTokenizer
 
     m = cfg["model"]
@@ -804,7 +668,7 @@ def embed_frozen(texts, cfg, device=None, batch_size=16, smoke=False):
         b = tok(texts[s:s + batch_size], truncation=True, max_length=max_length,
                 padding=True, return_tensors="pt").to(device)
         with torch.autocast("cuda", dtype=amp, enabled=amp is not None):
-            h = model(**b).last_hidden_state          # [B, T, H]
+            h = model(**b).last_hidden_state
         mask = b["attention_mask"].unsqueeze(-1).float()
         pooled = (h.float() * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
         out.append(F.normalize(pooled, p=2, dim=-1).cpu())

@@ -1,36 +1,3 @@
-"""Generation + hidden-state capture for open-weight chat models.
-
-For every unique prompt in the processed dataset this produces, per model:
-  answers/<prompt_id>.json          the decoded answer + generation metadata
-  hidden/<prompt_id>/<point>_layer_<NN>.npy
-                                    residual-stream vector at every layer, one file each
-                                    (output.hidden_layout: stacked gives one .npz instead)
-
-The configured capture point is `prompt_last`: the final token of the fully
-chat-formatted prompt, read from the prefill pass immediately before the model emits
-its first response token. It is taken from hidden_states[0][l][0, -1, :] and so is
-independent of anything that happens during generation.
-
-Design notes
-------------
-* batch size is fixed at 1. Padding perturbs hidden states (and pooled means), and
-  the whole point of this pass is clean activations, so we never batch.
-* one forward pass: generate(output_hidden_states=True) returns the prefill states
-  (all prompt positions) plus one state per generated token, for every layer.
-* hidden_states[0][l]      -> prefill, [1, n_prompt_tokens, H]
-  hidden_states[t][l], t>0 -> state AT generated token t, [1, 1, H]
-  l runs 0..n_blocks, where l=0 is the embedding output and l=n_blocks the final
-  hidden state after the last block (a 32-block model therefore gives 33 rows).
-* generate() stops after emitting token N without ever forwarding it, so the state
-  at the final generated token is missing from hidden_states. We recover it with one
-  extra 1-token forward on the returned KV cache; without that, gen_last and gen_mean
-  are silently off by one position. `gen_last_exact` in the record says whether that
-  succeeded. Note the final token is usually EOS (`final_token_is_eos`) -- if you want
-  the last *content* token instead, that is the position generate() itself reported.
-* stored arrays are [n_layer_rows, H], float16 by default, automatically promoted
-  to float32 if a value would overflow fp16 (some models carry massive outlier
-  activations in late layers).
-"""
 from __future__ import annotations
 
 import hashlib
@@ -51,9 +18,6 @@ FP16_MAX = 65504.0
 CAPTURE_POINTS = ("prompt_last", "prompt_mean", "gen_first", "gen_mean", "gen_last")
 
 
-# --------------------------------------------------------------------------- #
-# config / paths
-# --------------------------------------------------------------------------- #
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -72,16 +36,7 @@ def sha1(s):
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
-# --------------------------------------------------------------------------- #
-# prompt table
-# --------------------------------------------------------------------------- #
 def build_prompt_table(cfg, splits=None):
-    """Union of the requested split parquets, deduplicated to one row per prompt_id.
-
-    If prompts.screen_set is set (the model-screening config), that committed parquet is
-    used verbatim instead and the split names are ignored -- the screen set is its own
-    frozen sample, carrying a `group` column of 'random' / 'enriched'.
-    """
     pc = cfg["prompts"]
     id_col, text_col = pc["id_column"], pc["text_column"]
     wanted = list(splits) if splits else list(pc["splits"].keys())
@@ -90,8 +45,6 @@ def build_prompt_table(cfg, splits=None):
         tbl = pd.read_parquet(repo_path(pc["screen_set"]))
         tbl = tbl.rename(columns={id_col: "prompt_id", text_col: "prompt"})
         tbl["prompt"] = tbl["prompt"].astype(str)
-        # `splits` is what the runner writes into answers.jsonl; carry the screen group
-        # there so downstream code can tell the unbiased rows from the enriched ones.
         tbl["splits"] = "screen_" + tbl["group"].astype(str)
         tbl["prompt_sha1"] = [sha1(p) for p in tbl["prompt"]]
         if "n_chars" not in tbl:
@@ -109,7 +62,6 @@ def build_prompt_table(cfg, splits=None):
     allrows = pd.concat(frames, ignore_index=True)
     allrows[text_col] = allrows[text_col].astype(str)
 
-    # remember every split a prompt appeared in, then keep one row per prompt_id
     split_map = (allrows.groupby(id_col)["split"]
                  .agg(lambda s: ",".join(sorted(set(s)))).rename("splits"))
     tbl = (allrows.drop_duplicates(subset=[id_col])
@@ -117,7 +69,6 @@ def build_prompt_table(cfg, splits=None):
            .sort_values(id_col).reset_index(drop=True))
     tbl = tbl.rename(columns={id_col: "prompt_id", text_col: "prompt"})
 
-    # a prompt_id must map to exactly one prompt string, otherwise it is not a key
     n_pairs = allrows.drop_duplicates(subset=[id_col, text_col]).shape[0]
     if n_pairs != len(tbl):
         raise ValueError(f"{n_pairs - len(tbl)} prompt_id(s) carry more than one prompt text")
@@ -127,16 +78,11 @@ def build_prompt_table(cfg, splits=None):
     return tbl
 
 
-# --------------------------------------------------------------------------- #
-# capture helpers
-# --------------------------------------------------------------------------- #
 def _stack_layers(step_states, index):
-    """[n_layer_rows, H] float32 cpu, taking position `index` from each layer tensor."""
     return torch.stack([s[0, index, :].detach().float().cpu() for s in step_states])
 
 
 def _mean_layers(step_list):
-    """Mean over per-step layer tuples -> [n_layer_rows, H] float32 cpu."""
     n_rows = len(step_list[0])
     acc = None
     for step in step_list:
@@ -146,7 +92,6 @@ def _mean_layers(step_list):
 
 
 def _to_storage(arr, dtype):
-    """numpy array in `dtype`, promoted to float32 when fp16 cannot hold it."""
     a = arr.numpy() if isinstance(arr, torch.Tensor) else np.asarray(arr)
     if dtype == "float16" and (not np.isfinite(a).all() or np.abs(a).max() > FP16_MAX):
         return a.astype(np.float32), True
@@ -154,7 +99,6 @@ def _to_storage(arr, dtype):
 
 
 def select_layers(n_rows, spec):
-    """spec: 'all' | 'every:k' | list[int] -> sorted list of layer-row indices."""
     if spec in (None, "all"):
         return list(range(n_rows))
     if isinstance(spec, str) and spec.startswith("every:"):
@@ -166,9 +110,6 @@ def select_layers(n_rows, spec):
     return sorted({int(i) % n_rows for i in spec})
 
 
-# --------------------------------------------------------------------------- #
-# model spec
-# --------------------------------------------------------------------------- #
 @dataclass
 class ModelSpec:
     name: str
@@ -200,7 +141,6 @@ def parse_models(cfg, only=None):
 
 
 def preflight(spec):
-    """Cheap check that the installed transformers can actually build this arch."""
     from transformers import AutoConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
     cfg = AutoConfig.from_pretrained(spec.hf_id, trust_remote_code=spec.trust_remote_code)
@@ -216,11 +156,7 @@ def preflight(spec):
     }
 
 
-# --------------------------------------------------------------------------- #
-# runner
-# --------------------------------------------------------------------------- #
 class Runner:
-    """Loads one model and turns a prompt into (answer, per-layer activations)."""
 
     def __init__(self, spec: ModelSpec, gen_defaults: dict, capture: dict, log=print):
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -248,8 +184,6 @@ class Runner:
             self.model = AutoModelForImageTextToText.from_pretrained(spec.hf_id, **kw)
         self.model.eval()
 
-        # most instruct checkpoints ship sampling defaults in generation_config; under
-        # greedy decoding transformers warns about each one, so clear them explicitly
         if self.gen_kwargs.get("do_sample") is False:
             for k in ("temperature", "top_p", "top_k", "min_p", "typical_p"):
                 if getattr(self.model.generation_config, k, None) is not None:
@@ -267,7 +201,6 @@ class Runner:
         self.log(f"  loaded {spec.hf_id} in {self.load_s:.1f}s | hidden={self.hidden_size} "
                  f"blocks={self.n_blocks} dtype={spec.dtype} device_map={spec.device_map}")
 
-    # -- prompt formatting -------------------------------------------------- #
     def render(self, prompt):
         msgs = []
         if self.spec.system_prompt:
@@ -280,14 +213,13 @@ class Runner:
                 return_tensors="pt", **ctk)
             text = self.tok.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=False, **ctk)
-        except Exception as e:                      # tokenizer carries no chat template
+        except Exception as e:
             self.log(f"  chat template unavailable ({type(e).__name__}), using raw prompt")
             text = prompt
             enc = self.tok(text, return_tensors="pt")
         keep = ("input_ids", "attention_mask")
         return text, {k: v for k, v in dict(enc).items() if k in keep}
 
-    # -- one prompt --------------------------------------------------------- #
     @torch.inference_mode()
     def run(self, prompt):
         rendered, enc = self.render(prompt)
@@ -305,15 +237,10 @@ class Runner:
         answer = self.tok.decode(gen_ids, skip_special_tokens=True)
         n_gen = int(gen_ids.shape[0])
 
-        hs = out.hidden_states                      # tuple(steps) of tuple(layer rows)
-        n_rows = len(hs[0])                         # n_blocks + 1
+        hs = out.hidden_states
+        n_rows = len(hs[0])
         prefill, gen_steps = hs[0], list(hs[1:])
 
-        # generate() runs no forward pass at the position of the LAST generated token
-        # (nothing has to be predicted from it), so that residual stream is absent from
-        # out.hidden_states -- hs[-1] sits at token N-1. One extra 1-token forward on the
-        # returned cache recovers the real final state; without it every gen_* point is
-        # silently off by one.
         pkv, final_step = getattr(out, "past_key_values", None), None
         if n_gen > 0 and pkv is not None:
             try:
@@ -372,7 +299,7 @@ class Runner:
             "layers_saved": layers,
             "hidden_size": self.hidden_size,
             "n_gen_positions_captured": n_gen_positions,
-            "gen_last_exact": gen_last_exact,   # False -> gen_last sits at token N-1
+            "gen_last_exact": gen_last_exact,
             "final_token_is_eos": last_is_eos,
             "missing_gen_points": [] if n_gen_positions else
                                   sorted(want & {"gen_first", "gen_mean", "gen_last"}),
@@ -383,28 +310,21 @@ class Runner:
         return answer, vecs, meta
 
 
-# --------------------------------------------------------------------------- #
-# writers / readers
-# --------------------------------------------------------------------------- #
 def model_dirs(out_root, slug):
     root = repo_path(out_root) / slug
     return root, root / "answers", root / "hidden"
 
 
 def hidden_target(hid_dir, pid, layout):
-    """Where this prompt's activations live: a folder (per_layer) or a file (stacked)."""
     return hid_dir / (str(pid) if layout == "per_layer" else f"{pid}.npz")
 
 
 def already_done(ans_dir, hid_dir, pid, layout="per_layer"):
-    # the answer json is written last, so its presence means the hidden side finished
     return ((ans_dir / f"{pid}.json").exists()
             and hidden_target(hid_dir, pid, layout).exists())
 
 
 def _write_hidden(hid_dir, pid, arrays, layers, layout, compress):
-    """per_layer -> <pid>/<point>_layer_<NN>.npy, one file per layer per capture point.
-       stacked   -> <pid>.npz holding [n_layer_rows, H] per point."""
     target = hidden_target(hid_dir, pid, layout)
     if layout == "stacked":
         saver = np.savez_compressed if compress else np.savez
@@ -449,7 +369,6 @@ def write_prompt(ans_dir, hid_dir, row, answer, vecs, meta, spec, store_dtype, c
         "hidden_layout": layout,
         "hidden_path": (f"hidden/{pid}" if layout == "per_layer" else f"hidden/{pid}.npz"),
         "hidden_n_files": len(files),
-        # shape of ONE layer file under per_layer; of the stacked array under stacked
         "hidden_shapes": {k: list(v.shape[1:] if layout == "per_layer" else v.shape)
                           for k, v in arrays.items()},
         "hidden_dtypes": {k: str(v.dtype) for k, v in arrays.items()},
@@ -461,14 +380,6 @@ def write_prompt(ans_dir, hid_dir, row, answer, vecs, meta, spec, store_dtype, c
 
 
 def load_hidden(path, point="prompt_last", layer=None):
-    """Read one prompt's activations, whichever layout was written.
-
-    path   a hidden/<pid> folder (per_layer) or a hidden/<pid>.npz file (stacked)
-    layer  None -> every layer stacked, [n_layer_rows, H]
-           int  -> just that layer index, [H]
-
-    Returns (array float32, layer index array).
-    """
     path = Path(path)
     if path.is_dir():
         files = sorted(path.glob(f"{point}_layer_*.npy"))
@@ -489,11 +400,6 @@ def load_hidden(path, point="prompt_last", layer=None):
 
 
 def load_layer_matrix(model_root, layer, point="prompt_last", prompt_ids=None):
-    """Stack one layer across prompts -> ([n_prompts, H] float32, list of prompt_ids).
-
-    This is the shape a per-layer probe wants. Under the per_layer layout it opens one
-    small file per prompt, so expect it to be I/O bound on the first pass.
-    """
     model_root = Path(model_root)
     hid = model_root / "hidden"
     ids = ([int(p) for p in prompt_ids] if prompt_ids is not None else

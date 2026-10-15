@@ -1,8 +1,3 @@
-"""Data loading, reshaping, label collapse, duplicate analysis and grouped splits.
-
-Model input is the response text only. Everything else (prompt, models, winner
-flags, 5-class label) is carried as metadata for later error analysis.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -29,9 +24,6 @@ def repo_path(rel):
     return p if p.is_absolute() else REPO_ROOT / p
 
 
-# --------------------------------------------------------------------------- #
-# Step 1: load + reshape
-# --------------------------------------------------------------------------- #
 def download_raw(cfg):
     d = cfg["dataset"]
     return Path(hf_hub_download(repo_id=d["repo_id"], filename=d["filename"],
@@ -39,7 +31,6 @@ def download_raw(cfg):
 
 
 def _unwrap_json_list(df, col, id_col="id"):
-    """json.loads each cell, assert the list has exactly one element, return element 0."""
     out, bad_parse, bad_len = [], [], []
     for rid, raw in zip(df[id_col], df[col]):
         try:
@@ -63,7 +54,6 @@ def _unwrap_json_list(df, col, id_col="id"):
 
 
 def melt_pairs(raw):
-    """1 row per pair -> 2 rows per pair (side a / side b)."""
     prompt = _unwrap_json_list(raw, "prompt")
     resp = {s: _unwrap_json_list(raw, "response_" + s) for s in ("a", "b")}
 
@@ -74,7 +64,6 @@ def melt_pairs(raw):
             "side": side,
             "response_text": resp[side],
             "label_5_raw": raw["refusal_label_" + side],
-            # --- metadata below; never a model input ---
             "prompt": prompt,
             "model": raw["model_" + side],
             "model_a": raw["model_a"],
@@ -112,9 +101,6 @@ def collapse_labels(df, cfg):
     return df.drop(columns=["label_5_raw"])
 
 
-# --------------------------------------------------------------------------- #
-# Step 1.4: duplicate / leakage analysis
-# --------------------------------------------------------------------------- #
 def normalise_text(s):
     return _WS.sub(" ", str(s).strip()).casefold()
 
@@ -178,9 +164,6 @@ def duplicate_report(df, top_k=10):
     return rep
 
 
-# --------------------------------------------------------------------------- #
-# Step 1.5: length percentiles
-# --------------------------------------------------------------------------- #
 def length_report(df, cfg):
     from transformers import AutoTokenizer
 
@@ -206,9 +189,6 @@ def length_report(df, cfg):
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Step 2: grouped stratified splits
-# --------------------------------------------------------------------------- #
 class _UnionFind:
     def __init__(self):
         self.parent = {}
@@ -227,11 +207,6 @@ class _UnionFind:
 
 
 def build_groups(df):
-    """Connected components over (prompt_id, text_hash).
-
-    Both responses in a pair share a prompt_id; identical normalised texts share
-    a text_hash. Both are leakage channels, so they are merged into one key.
-    """
     uf = _UnionFind()
     for pid, h in zip(df["prompt_id"], df["text_hash"]):
         uf.union(("P", int(pid)), ("H", h))

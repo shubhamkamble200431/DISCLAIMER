@@ -1,35 +1,3 @@
-"""Step 2b of plan.md -- select the top-10 steering layers, per model, on the 15% split.
-
-Runs ENTIRELY on the `prompt_last` activations already on disk. No GPU, no generation.
-The GPU was only ever needed to produce these vectors, and that happened in September.
-
-For every layer row of every model, using ONLY the 262 Layer-Probing prompts:
-
-  probe_bacc_3     5-fold CV balanced accuracy, 3-class, standardised + logistic regression
-  probe_bacc_RN    same, REFUSAL vs NORMAL
-  probe_bacc_DN    same, DISCLAIMER vs NORMAL
-  rel_R, rel_D     split-half cosine reliability of the difference-in-means direction:
-                   estimate d on each half of a random 50/50 prompt split, take cos
-                   between the halves, average over --n-halves draws
-
-Selection score = probe_bacc_3 x mean(rel_R, rel_D).
-
-Why the reliability term is not optional: accuracy alone will happily rank a layer whose
-direction is half noise. A probe can separate classes using a subspace that the
-difference-in-means vector does not point along, and it is the DiM vector that gets
-steered. Measured on this data, rel_R runs ~0.45 at layer 1 and ~0.95 from layer 20 up.
-
-Row 0 is the embedding output and is byte-identical across prompts (the capture point is
-always the same chat-template token), so no direction exists there. Row n_blocks is
-post-final-RMSNorm and is not a hookable residual site. Both are scored and reported for
-completeness but EXCLUDED from selection.
-
-The selected list is committed with a sha256, the same way the split is.
-
-Usage:
-  python -X utf8 scripts/layer_probe.py
-  python -X utf8 scripts/layer_probe.py --top-k 10 --n-halves 50
-"""
 from __future__ import annotations
 
 import argparse
@@ -49,9 +17,9 @@ from sklearn.preprocessing import StandardScaler
 ROOT = Path(__file__).resolve().parents[1]
 GEN = ROOT / "data" / "generated"
 STUDY = ROOT / "data" / "study"
-PRED = ROOT.parent / "refusal_classifier" / "results" / "predictions" / "generated_predictions.parquet"
+PRED = ROOT.parent / "classifier" / "results" / "predictions" / "generated_predictions.parquet"
 
-MODELS = ["qwen3-5-4b", "gemma-4-e2b", "qwen3-5-9b"]
+MODELS = ["qwen3-5-4b", "olmo3-7b"]
 LABELS = ["NORMAL", "DISCLAIMER", "REFUSAL"]
 
 
@@ -71,7 +39,6 @@ def load_stack(model_root: Path, prompt_ids, n_rows, log):
 
 
 def cv_bacc(X, y, seed, folds=5):
-    """5-fold CV balanced accuracy. Returns None when a class is too small to fold."""
     u, c = np.unique(y, return_counts=True)
     if len(u) < 2 or c.min() < folds:
         return None
@@ -94,7 +61,6 @@ def dim_direction(X, lab, pos, neg):
 
 
 def split_half_reliability(X, lab, pos, neg, n_halves, rng):
-    """Mean cosine between the DiM direction estimated on two disjoint prompt halves."""
     idx = np.arange(len(X))
     cos = []
     for _ in range(n_halves):
@@ -146,7 +112,7 @@ def main():
         cnt = {c: int((yp == c).sum()) for c in LABELS}
         log(f"    probing labels {cnt}   direction n={len(kept_d)}")
 
-        y3 = np.searchsorted(np.array(LABELS), yp)  # not order-preserving; use explicit map
+        y3 = np.searchsorted(np.array(LABELS), yp)
         y3 = np.array([LABELS.index(v) for v in yp])
 
         rows = []
@@ -163,7 +129,6 @@ def main():
             rR, sR = split_half_reliability(Xl, yp, "REFUSAL", "NORMAL", args.n_halves, rng)
             rD, sD = split_half_reliability(Xl, yp, "DISCLAIMER", "NORMAL", args.n_halves,
                                             np.random.default_rng(args.seed + 1000 + l))
-            # same statistic on the larger direction split, as a noise check
             rR_d, _ = split_half_reliability(Xdl, yd, "REFUSAL", "NORMAL", args.n_halves,
                                              np.random.default_rng(args.seed + 2000 + l))
             rD_d, _ = split_half_reliability(Xdl, yd, "DISCLAIMER", "NORMAL", args.n_halves,

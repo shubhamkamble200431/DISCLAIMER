@@ -1,19 +1,3 @@
-"""Does batched prompt_last capture match batch-1 capture? (gate for step 1 --batch-size N)
-
-For each model: pick ~50 prompts spread evenly across the rendered-length distribution,
-capture the prefill's last-token state at every layer
-
-  * at batch 1                                   (the reference, identical to Runner.run)
-  * in the real run's length-bucketed batches   (--batch-size, default 32)
-  * in deliberately MIXED-length batches of 8   (worst case for padding)
-
-and compare per layer: cosine and relative L2 error against the reference. A model is
-marked pass only if BOTH batched variants stay inside the thresholds on every steerable
-row (1 .. n_blocks-1). The result is written to data/study/step1_batch_parity.json, which
-run_study_all_real.sh reads to decide per model between --batch-size N and batch 1.
-
-Prefill-only, so it takes minutes per model, not hours.
-"""
 from __future__ import annotations
 
 import argparse
@@ -29,12 +13,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import batched_capture as BC   # noqa: E402
-from src import generate as G           # noqa: E402
-from src import steer as S              # noqa: E402
+from src import batched_capture as BC
+from src import generate as G
+from src import steer as S
 
-MIN_COS = 0.998        # per prompt, per steerable row
-MAX_REL_L2 = 0.05      # per prompt, per steerable row
+MIN_COS = 0.998
+MAX_REL_L2 = 0.05
 
 
 def capture(runner, texts):
@@ -42,9 +26,6 @@ def capture(runner, texts):
         return BC.prefill_last_states(runner, texts)
     except torch.cuda.OutOfMemoryError:
         pass
-    # Retry OUTSIDE the except block: inside it the failed attempt's traceback still
-    # references its all-layer hidden-state tensors, so recursing there kept them alive
-    # and every smaller retry OOMed too.
     gc.collect()
     torch.cuda.empty_cache()
     if len(texts) == 1:
@@ -64,7 +45,6 @@ def run_plan(runner, texts, batches):
 
 
 def compare(ref, got, n_blocks):
-    """ref, got: [N, rows, H]. Metrics over steerable rows 1..n_blocks-1."""
     rows = slice(1, n_blocks)
     a, b = got[:, rows].double(), ref[:, rows].double()
     cos = (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp_min(1e-12)
@@ -91,7 +71,7 @@ def main():
     ap.add_argument("--n-prompts", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--mixed-batch-size", type=int, default=8)
-    ap.add_argument("--out", default="data/study/step1_batch_parity.json")
+    ap.add_argument("--out", default="data/study/generate_label_split_batch_parity.json")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 

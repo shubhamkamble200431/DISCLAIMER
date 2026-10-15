@@ -1,34 +1,3 @@
-"""Run each configured model over every unique dataset prompt, saving the answer and
-the per-layer hidden states.
-
-Output layout (one folder per model, two folders inside it):
-
-  data/generated/
-    prompts.parquet                 the resolved prompt table (id, text, sha1, splits)
-    <model-slug>/
-      answers/<prompt_id>.json      answer text + generation metadata
-      hidden/<prompt_id>/           one folder per prompt (output.hidden_layout: per_layer)
-        prompt_last_layer_00.npy    [hidden] float16, one file per layer per capture point
-        prompt_last_layer_01.npy
-        ...
-      answers.jsonl                 append-only index of every completed prompt
-      manifest.json                 model info, config snapshot, counts, timings
-      run.log
-
-Set output.hidden_layout: stacked instead to get one hidden/<prompt_id>.npz per prompt
-holding [n_layer_rows, hidden] per capture point -- same bytes, ~58k fewer files.
-
-Resumable: a prompt whose answer json and hidden target both exist is skipped unless
---overwrite. The answer json is written last, so it is a reliable completion marker.
-Models are loaded and run one at a time; never run two of these in parallel on one GPU.
-
-Usage (PowerShell):
-  python -X utf8 scripts/generate_activations.py --config configs/generate.yaml --preflight
-  python -X utf8 scripts/generate_activations.py --config configs/generate.yaml --smoke
-  python -X utf8 scripts/generate_activations.py --config configs/generate.yaml
-  python -X utf8 scripts/generate_activations.py --config configs/generate.yaml \
-      --models qwen3.5-4b --splits train,val --limit 200
-"""
 from __future__ import annotations
 
 import argparse
@@ -45,7 +14,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import generate as G    # noqa: E402
+from src import generate as G
 
 
 class Tee:
@@ -162,7 +131,7 @@ def run_model(spec, prompts, cfg, args, log_root):
             torch.cuda.empty_cache()
             n_failed += 1
             failures.append({"prompt_id": pid, "error": "OutOfMemoryError", "msg": str(e)[:300]})
-            log(f"    [{pid}] OOM -- skipped (lower max_new_tokens or use a bigger GPU)")
+            log(f"    [{pid}] OOM -- skipped (lower max_new_tokens or use a device with more memory)")
         except Exception as e:
             n_failed += 1
             failures.append({"prompt_id": pid, "error": type(e).__name__, "msg": str(e)[:300]})
