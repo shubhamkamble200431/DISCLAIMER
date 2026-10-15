@@ -9,20 +9,20 @@ DISCLAIMER/
 ├── requirements.txt
 |── classifier/                       
 │   ├── configs/
-|   │   └── longformer.yaml           
-|   ├── data/
-|   │   └── processed/
-|   │       ├── train.parquet         
-|   │       ├── val.parquet           
-|   │       └── test.parquet          
-|   ├── scripts/
-|   │   ├── train_transformer.py      
-|   │   └── predict.py                
-|   └── src/
-|        ├── data.py                   
-|        ├── train.py                  
-|        └── metrics.py  
-|
+│   │   └── longformer.yaml           
+│   ├── data/
+│   │   └── processed/
+│   │       ├── train.parquet         
+│   │       ├── val.parquet           
+│   │       └── test.parquet          
+│   ├── scripts/
+│   │   ├── train_transformer.py      
+│   │   └── predict.py                
+│   └── src/
+│        ├── data.py                   
+│        ├── train.py                  
+│        └── metrics.py  
+│
 └── generation/                       
     ├── configs/
     │   ├── study.yaml                
